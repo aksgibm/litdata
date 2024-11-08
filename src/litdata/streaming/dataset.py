@@ -260,6 +260,8 @@ class StreamingDataset(IterableDataset):
         )
         indexes = _replay_sampling(num_samples_yielded, batch_size, num_workers)
         chunks_index, indexes = _replay_chunks_sampling(workers_intervals, indexes)
+        if any([len(workers_intervals[worker_idx]) <= chunks_index[worker_idx] for worker_idx in range(num_workers)]):
+            chunks_index, indexes = _replay_chunks_sampling_residual_case(workers_intervals, num_samples_yielded)
 
         # select the chunks and intervals associated to this worker
         worker_rank = self.worker_env.rank
@@ -528,4 +530,30 @@ def _replay_chunks_sampling(
                 # We've reached the chunk where resuming needs to take place (for this worker)
                 break
 
+    return chunks_index, indexes
+
+def _replay_chunks_sampling_residual_case(
+    workers_intervals: Dict[int, List[Any]], num_samples_yielded: int
+    ) -> Tuple[Dict[int, int], Dict[int, int]]:
+    chunks_index = {}
+    indexes = {}
+    
+    for worker_idx in range(len(workers_intervals)):
+        chunks_index[worker_idx] = -1
+        indexes[worker_idx] = 0
+    for worker_idx, intervals in workers_intervals.items():
+        for interval in intervals:
+            size = interval[2] - interval[1]
+            last_idx = interval[2] - 1
+            first_idx = interval[1]
+            chunks_index[worker_idx] += 1
+            if num_samples_yielded > last_idx:
+                indexes[worker_idx] = size
+                continue
+            elif num_samples_yielded > first_idx:
+                indexes[worker_idx] = num_samples_yielded - first_idx
+                break
+            else:
+                indexes[worker_idx] = 0
+                break
     return chunks_index, indexes
