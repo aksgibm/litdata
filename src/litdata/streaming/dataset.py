@@ -289,6 +289,8 @@ class StreamingDataset(IterableDataset):
 
         state: Dict[str, Any] = self._state_dict
 
+        logger.info("calling _resume")
+
         num_workers = state["num_workers"]
         batch_size = state["batch_size"]
 
@@ -307,7 +309,16 @@ class StreamingDataset(IterableDataset):
         workers_intervals_ = [workers_intervals[i] for i in range(worker_start,worker_end)]
         
         if any([len(workers_intervals_[worker_idx]) <= chunks_index[worker_idx] for worker_idx in range(num_workers)]):
+            logger.info("calling _replay_chunks_sampling_residual_case")
+            logger.info(f"worker_intervals_: {workers_intervals_}")
+            logger.info(f"worker_start: {worker_start}")
+            logger.info(f"worker_end: {worker_end}")
+            logger.info(f"chunks_index: {chunks_index}")
+            logger.info(f"num_samples_yielded: {num_samples_yielded}")
             chunks_index, indexes = _replay_chunks_sampling_residual_case(workers_intervals_, num_samples_yielded)
+            logger.info("_replay_chunks_sampling_residual_case done")
+            logger.info(f"chunks_index: {chunks_index}")
+            logger.info(f"indexes: {indexes}")
 
         # select the chunks and intervals associated to this worker
         worker_rank = self.distributed_env.global_rank * self.worker_env.world_size + self.worker_env.rank
