@@ -1,11 +1,20 @@
+import glob
 import os
+import random
+import shutil
 import sys
+from pathlib import Path
 from unittest import mock
 
+import cryptography
+import numpy as np
 import pytest
+import requests
 from litdata import StreamingDataset, merge_datasets, optimize, walk
 from litdata.processing.functions import _get_input_dir, _resolve_dir
 from litdata.streaming.cache import Cache
+from litdata.utilities.encryption import FernetEncryption, RSAEncryption
+from PIL import Image
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="currently not supported for windows.")
@@ -64,7 +73,12 @@ def another_fn(i: int):
     return i, i**2
 
 
-@pytest.mark.skipif(sys.platform == "win32" or sys.platform == "darwin", reason="too slow")
+def random_image(index):
+    fake_img = Image.fromarray(np.random.randint(0, 255, (32, 32, 3), dtype=np.uint8))
+    return {"image": fake_img, "class": index}
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="too slow")
 def test_optimize_append_overwrite(tmpdir):
     output_dir = str(tmpdir / "output_dir")
 
@@ -167,7 +181,7 @@ def test_optimize_append_overwrite(tmpdir):
     assert ds[:] == [(i, i**2, i**3) for i in range(0, 5)]
 
 
-@pytest.mark.skipif(sys.platform == "win32" or sys.platform == "darwin", reason="too slow")
+@pytest.mark.skipif(sys.platform == "win32", reason="too slow")
 def test_optimize_checkpoint_in_none_and_append_mode(tmpdir):
     output_dir = str(tmpdir / "output_dir")
 
@@ -179,6 +193,7 @@ def test_optimize_checkpoint_in_none_and_append_mode(tmpdir):
             chunk_size=1,
             num_workers=2,
             use_checkpoint=True,
+            start_method="fork",
         )
 
     # check that the checkpoints are created
@@ -192,6 +207,7 @@ def test_optimize_checkpoint_in_none_and_append_mode(tmpdir):
         chunk_size=1,
         num_workers=2,
         use_checkpoint=True,
+        start_method="fork",
     )
 
     ds = StreamingDataset(output_dir)
@@ -212,6 +228,7 @@ def test_optimize_checkpoint_in_none_and_append_mode(tmpdir):
             num_workers=2,
             use_checkpoint=True,
             mode="append",
+            start_method="fork",
         )
 
     # check that the checkpoints are created
@@ -231,6 +248,7 @@ def test_optimize_checkpoint_in_none_and_append_mode(tmpdir):
         num_workers=2,
         use_checkpoint=True,
         mode="append",
+        start_method="fork",
     )
 
     ds = StreamingDataset(output_dir)
@@ -272,3 +290,243 @@ def test_merge_datasets(tmpdir):
 
     assert len(ds) == 20
     assert ds[:] == list(range(20))
+
+
+@pytest.mark.timeout(10)
+def test_merge_compressed_datasets(tmpdir):
+    folder_1 = os.path.join(tmpdir, "folder_1")
+    folder_2 = os.path.join(tmpdir, "folder_2")
+    folder_3 = os.path.join(tmpdir, "folder_3")
+
+    os.makedirs(folder_1, exist_ok=True)
+    os.makedirs(folder_2, exist_ok=True)
+
+    cache_1 = Cache(input_dir=folder_1, chunk_bytes="64MB", compression="zstd")
+    for i in range(10):
+        cache_1[i] = i
+
+    cache_1.done()
+    cache_1.merge()
+
+    cache_2 = Cache(input_dir=folder_2, chunk_bytes="64MB", compression="zstd")
+    for i in range(10, 20):
+        cache_2[i] = i
+
+    cache_2.done()
+    cache_2.merge()
+
+    merge_datasets(
+        input_dirs=[folder_1, folder_2],
+        output_dir=folder_3,
+    )
+
+    ds = StreamingDataset(input_dir=folder_3)
+
+    assert len(ds) == 20
+    assert ds[:] == list(range(20))
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Not tested on windows")
+def test_optimize_with_fernet_encryption(tmpdir):
+    output_dir = str(tmpdir / "output_dir")
+
+    # ----------------- sample level -----------------
+    fernet = FernetEncryption(password="password", level="sample")
+    optimize(
+        fn=compress,
+        inputs=list(range(5)),
+        num_workers=1,
+        output_dir=output_dir,
+        chunk_bytes="64MB",
+        encryption=fernet,
+    )
+
+    ds = StreamingDataset(output_dir, encryption=fernet)
+    assert len(ds) == 5
+    assert ds[:] == [(i, i**2) for i in range(5)]
+
+    # ----------------- chunk level -----------------
+    fernet = FernetEncryption(password="password", level="chunk")
+    optimize(
+        fn=compress,
+        inputs=list(range(5)),
+        num_workers=1,
+        output_dir=output_dir,
+        chunk_bytes="64MB",
+        encryption=fernet,
+        mode="overwrite",
+    )
+
+    ds = StreamingDataset(output_dir, encryption=fernet)
+    assert len(ds) == 5
+    assert ds[:] == [(i, i**2) for i in range(5)]
+
+    # ----------------- test with appending more -----------------
+    optimize(
+        fn=compress,
+        inputs=list(range(5, 10)),
+        num_workers=1,
+        output_dir=output_dir,
+        chunk_bytes="64MB",
+        encryption=fernet,
+        mode="append",
+    )
+    ds = StreamingDataset(output_dir, encryption=fernet)
+    assert len(ds) == 10
+    assert ds[:] == [(i, i**2) for i in range(10)]
+
+    # ----------------- decrypt with different conf  -----------------
+    ds = StreamingDataset(output_dir)
+    with pytest.raises(ValueError, match="Data is encrypted but no encryption object was provided."):
+        ds[0]
+
+    fernet.level = "sample"
+    ds = StreamingDataset(output_dir, encryption=fernet)
+    with pytest.raises(ValueError, match="Encryption level mismatch."):
+        ds[0]
+
+    fernet = FernetEncryption(password="password", level="chunk")
+    ds = StreamingDataset(output_dir, encryption=fernet)
+    with pytest.raises(cryptography.fernet.InvalidToken, match=""):
+        ds[0]
+
+    # ----------------- test with other alg -----------------
+    rsa = RSAEncryption(password="password", level="sample")
+    ds = StreamingDataset(output_dir, encryption=rsa)
+    with pytest.raises(ValueError, match="Encryption algorithm mismatch."):
+        ds[0]
+
+    # ----------------- test with random images -----------------
+
+    fernet = FernetEncryption(password="password", level="chunk")
+    optimize(
+        fn=random_image,
+        inputs=list(range(5)),
+        num_workers=1,
+        output_dir=output_dir,
+        chunk_bytes="64MB",
+        encryption=fernet,
+        mode="overwrite",
+    )
+
+    ds = StreamingDataset(output_dir, encryption=fernet)
+
+    assert len(ds) == 5
+    assert ds[0]["class"] == 0
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Not tested on windows")
+def test_optimize_with_rsa_encryption(tmpdir):
+    output_dir = str(tmpdir / "output_dir")
+
+    # ----------------- sample level -----------------
+    rsa = RSAEncryption(password="password", level="sample")
+    optimize(
+        fn=compress,
+        inputs=list(range(5)),
+        num_workers=1,
+        output_dir=output_dir,
+        chunk_bytes="64MB",
+        encryption=rsa,
+    )
+
+    ds = StreamingDataset(output_dir, encryption=rsa)
+    assert len(ds) == 5
+    assert ds[:] == [(i, i**2) for i in range(5)]
+
+    # ----------------- chunk level -----------------
+    rsa = RSAEncryption(password="password", level="chunk")
+    optimize(
+        fn=compress,
+        inputs=list(range(5)),
+        num_workers=1,
+        output_dir=output_dir,
+        chunk_bytes="64MB",
+        encryption=rsa,
+        mode="overwrite",
+    )
+
+    ds = StreamingDataset(output_dir, encryption=rsa)
+    assert len(ds) == 5
+    assert ds[:] == [(i, i**2) for i in range(5)]
+
+    # ----------------- test with appending more -----------------
+    optimize(
+        fn=compress,
+        inputs=list(range(5, 10)),
+        num_workers=1,
+        output_dir=output_dir,
+        chunk_bytes="64MB",
+        encryption=rsa,
+        mode="append",
+    )
+    ds = StreamingDataset(output_dir, encryption=rsa)
+    assert len(ds) == 10
+    assert ds[:] == [(i, i**2) for i in range(10)]
+
+    # ----------------- decrypt with different conf  -----------------
+    ds = StreamingDataset(output_dir)
+    with pytest.raises(ValueError, match="Data is encrypted but no encryption object was provided."):
+        ds[0]
+
+    # ----------------- test with random images  -----------------
+    # RSA Encryption throws an error: ValueError: Encryption failed, when trying to encrypt large data
+    # optimize(
+    #     fn=random_image,
+    #     inputs=list(range(5)),
+    #     num_workers=1,
+    #     output_dir=output_dir,
+    #     chunk_bytes="64MB",
+    #     encryption=rsa,
+    #     mode="overwrite",
+    # )
+
+
+def tokenize(filename: str):
+    with open(filename, encoding="utf-8") as file:
+        text = file.read()
+    text = text.strip().split(" ")
+    word_to_int = {word: random.randint(1, 1000) for word in set(text)}  # noqa: S311
+    tokenized = [word_to_int[word] for word in text]
+
+    yield tokenized
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Not tested on windows")
+def test_optimize_race_condition(tmpdir):
+    # issue: https://github.com/Lightning-AI/litdata/issues/367
+    # run_commands = [
+    #     "mkdir -p tempdir/custom_texts",
+    #     "curl https://www.gutenberg.org/cache/epub/24440/pg24440.txt --output tempdir/custom_texts/book1.txt",
+    #     "curl https://www.gutenberg.org/cache/epub/26393/pg26393.txt --output tempdir/custom_texts/book2.txt",
+    # ]
+    shutil.rmtree(f"{tmpdir}/custom_texts", ignore_errors=True)
+    os.makedirs(f"{tmpdir}/custom_texts", exist_ok=True)
+
+    urls = [
+        "https://www.gutenberg.org/cache/epub/24440/pg24440.txt",
+        "https://www.gutenberg.org/cache/epub/26393/pg26393.txt",
+    ]
+
+    for i, url in enumerate(urls):
+        print(f"downloading {i+1} file")
+        with requests.get(url, stream=True, timeout=10) as r:
+            r.raise_for_status()  # Raise an exception for bad status codes
+
+            with open(f"{tmpdir}/custom_texts/book{i+1}.txt", "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
+
+    print("=" * 100)
+
+    train_files = sorted(glob.glob(str(Path(f"{tmpdir}/custom_texts") / "*.txt")))
+    print("=" * 100)
+    print(train_files)
+    print("=" * 100)
+    optimize(
+        fn=tokenize,
+        inputs=train_files,
+        output_dir=f"{tmpdir}/temp",
+        num_workers=1,
+        chunk_bytes="50MB",
+    )

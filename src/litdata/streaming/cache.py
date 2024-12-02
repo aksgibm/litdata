@@ -24,6 +24,7 @@ from litdata.streaming.resolver import Dir, _resolve_dir
 from litdata.streaming.sampler import ChunkedIndex
 from litdata.streaming.serializers import Serializer
 from litdata.streaming.writer import BinaryWriter
+from litdata.utilities.encryption import Encryption
 from litdata.utilities.env import _DistributedEnv, _WorkerEnv
 from litdata.utilities.format import _convert_bytes_to_int
 
@@ -37,27 +38,33 @@ class Cache:
         subsampled_files: Optional[List[str]] = None,
         region_of_interest: Optional[List[Tuple[int, int]]] = None,
         compression: Optional[str] = None,
+        encryption: Optional[Encryption] = None,
         chunk_size: Optional[int] = None,
         chunk_bytes: Optional[Union[int, str]] = None,
         item_loader: Optional[BaseItemLoader] = None,
         max_cache_size: Union[int, str] = "100GB",
         serializers: Optional[Dict[str, Serializer]] = None,
         writer_chunk_index: Optional[int] = None,
+        storage_options: Optional[Dict] = {},
+        max_pre_download: int = 2,
     ):
         """The Cache enables to optimise dataset format for cloud training. This is done by grouping several elements
         together in order to accelerate fetching.
 
-        Arguments:
+        Args:
             input_dir: The path to where the chunks will be or are stored.
             subsampled_files: List of subsampled chunk files loaded from `input_dir/index.json` file.
             region_of_interest: List of tuples of (start,end) of region of interest for each chunk.
             compression: The name of the algorithm to reduce the size of the chunks.
+            encryption: The encryption algorithm to use.
             chunk_bytes: The maximum number of bytes within a chunk.
             chunk_size: The maximum number of items within a chunk.
             item_loader: The object responsible to generate the chunk intervals and load an item froma chunk.
             max_cache_size: The maximum cache size used by the reader when fetching the chunks.
             serializers: Provide your own serializers.
             writer_chunk_index: The index of the chunk to start from when writing.
+            storage_options: Additional connection options for accessing storage services.
+            max_pre_download: Maximum number of chunks that can be pre-downloaded while filling up the cache.
 
         """
         super().__init__()
@@ -69,8 +76,10 @@ class Cache:
             chunk_size=chunk_size,
             chunk_bytes=chunk_bytes,
             compression=compression,
+            encryption=encryption,
             serializers=serializers,
             chunk_index=writer_chunk_index or 0,
+            item_loader=item_loader,
         )
         self._reader = BinaryReader(
             self._cache_dir,
@@ -79,8 +88,11 @@ class Cache:
             max_cache_size=_convert_bytes_to_int(max_cache_size) if isinstance(max_cache_size, str) else max_cache_size,
             remote_input_dir=input_dir.url,
             compression=compression,
+            encryption=encryption,
             item_loader=item_loader,
             serializers=serializers,
+            storage_options=storage_options,
+            max_pre_download=max_pre_download,
         )
         self._is_done = False
         self._distributed_env = _DistributedEnv.detect()

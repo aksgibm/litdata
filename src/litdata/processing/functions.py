@@ -27,7 +27,9 @@ from urllib import parse
 
 import torch
 
-from litdata.constants import _INDEX_FILENAME, _IS_IN_STUDIO, _TQDM_AVAILABLE
+from litdata import __version__
+from litdata.constants import _INDEX_FILENAME, _IS_IN_STUDIO
+from litdata.helpers import _check_version_and_prompt_upgrade
 from litdata.processing.data_processor import DataChunkRecipe, DataProcessor, DataTransformRecipe
 from litdata.processing.readers import BaseReader
 from litdata.processing.utilities import (
@@ -38,6 +40,7 @@ from litdata.processing.utilities import (
 )
 from litdata.streaming.client import S3Client
 from litdata.streaming.dataloader import StreamingDataLoader
+from litdata.streaming.item_loader import BaseItemLoader
 from litdata.streaming.resolver import (
     Dir,
     _assert_dir_has_index_file,
@@ -46,13 +49,8 @@ from litdata.streaming.resolver import (
     _resolve_dir,
 )
 from litdata.utilities._pytree import tree_flatten
-
-if _TQDM_AVAILABLE:
-    from tqdm.auto import tqdm as _tqdm
-else:
-
-    def _tqdm(iterator: Any) -> Any:
-        yield from iterator
+from litdata.utilities.encryption import Encryption
+from litdata.utilities.format import _get_tqdm_iterator_if_available
 
 
 def _is_remote_file(path: str) -> bool:
@@ -103,7 +101,7 @@ def _get_default_num_workers() -> int:
 
 
 class LambdaDataTransformRecipe(DataTransformRecipe):
-    def __init__(self, fn: Callable[[str, Any], None], inputs: Sequence[Any]):
+    def __init__(self, fn: Callable[[str, Any], None], inputs: Union[Sequence[Any], StreamingDataLoader]):
         super().__init__()
         self._fn = fn
         self._inputs = inputs
@@ -149,13 +147,14 @@ class LambdaDataChunkRecipe(DataChunkRecipe):
     def __init__(
         self,
         fn: Callable[[Any], None],
-        inputs: Sequence[Any],
+        inputs: Union[Sequence[Any], StreamingDataLoader],
         chunk_size: Optional[int],
         chunk_bytes: Optional[Union[int, str]],
         compression: Optional[str],
+        encryption: Optional[Encryption] = None,
         existing_index: Optional[Dict[str, Any]] = None,
     ):
-        super().__init__(chunk_size=chunk_size, chunk_bytes=chunk_bytes, compression=compression)
+        super().__init__(chunk_size=chunk_size, chunk_bytes=chunk_bytes, compression=compression, encryption=encryption)
         self._fn = fn
         self._inputs = inputs
         self.is_generator = False
@@ -183,12 +182,12 @@ class LambdaDataChunkRecipe(DataChunkRecipe):
         return self._inputs
 
     def prepare_item(self, item_metadata: Any) -> Any:
-        """This method is overriden dynamically."""
+        """Being overridden dynamically."""
 
 
 def map(
     fn: Callable[[str, Any], None],
-    inputs: Sequence[Any],
+    inputs: Union[Sequence[Any], StreamingDataLoader],
     output_dir: Union[str, Dir],
     input_dir: Optional[str] = None,
     weights: Optional[List[int]] = None,
@@ -203,12 +202,11 @@ def map(
     reader: Optional[BaseReader] = None,
     batch_size: Optional[int] = None,
 ) -> None:
-    """This function map a callbable over a collection of files possibly in a distributed way.
+    """Maps a callable over a collection of inputs, possibly in a distributed way.
 
-    Arguments:
+    Args:
         fn: A function to be executed over each input element
-        inputs: A sequence of input to be processed by the `fn` function.
-            Each input should contain at least a valid filepath.
+        inputs: A sequence of input to be processed by the `fn` function, or a streaming dataloader.
         output_dir: The folder where the processed data should be stored.
         input_dir: Provide the path where your files are stored. If the files are on a remote storage,
             they will be downloaded in the background while processed.
@@ -222,9 +220,12 @@ def map(
         reorder_files: By default, reorders the files by file size to distribute work equally among all workers.
             Set this to ``False`` if the order in which samples are processed should be preserved.
         error_when_not_empty: Whether we should error if the output folder isn't empty.
+        reader: The reader to use when reading the data. By default, it uses the `BaseReader`.
         batch_size: Group the inputs into batches of batch_size length.
 
     """
+    _check_version_and_prompt_upgrade(__version__)
+
     if isinstance(inputs, StreamingDataLoader) and batch_size is not None:
         raise ValueError("When providing a streaming dataloader, pass the batch_size to the dataloader directly.")
 
@@ -232,7 +233,9 @@ def map(
         raise ValueError("When providing a streaming dataloader, weights isn't supported.")
 
     if not isinstance(inputs, (Sequence, StreamingDataLoader)):
-        raise ValueError(f"The provided inputs should be non empty sequence or a streaming dataloader. Found {inputs}.")
+        raise ValueError(
+            f"The provided inputs should be a non-empty sequence or a streaming dataloader. Found {inputs}."
+        )
 
     if len(inputs) == 0:
         raise ValueError(f"The provided inputs should be non empty. Found {inputs}.")
@@ -255,7 +258,7 @@ def map(
         if _output_dir.url and "cloudspaces" in _output_dir.url:
             raise ValueError(
                 f"The provided `output_dir` isn't valid. Found {_output_dir.path if _output_dir else None}."
-                " HINT: You can either use `/teamspace/s3_connections/...` or `/teamspace/datasets/...`."
+                "\n HINT: You can either use `/teamspace/s3_connections/...` or `/teamspace/datasets/...`."
             )
 
         if error_when_not_empty:
@@ -295,13 +298,14 @@ def map(
 
 def optimize(
     fn: Callable[[Any], Any],
-    inputs: Sequence[Any],
+    inputs: Union[Sequence[Any], StreamingDataLoader],
     output_dir: str,
     input_dir: Optional[str] = None,
     weights: Optional[List[int]] = None,
     chunk_size: Optional[int] = None,
     chunk_bytes: Optional[Union[int, str]] = None,
     compression: Optional[str] = None,
+    encryption: Optional[Encryption] = None,
     num_workers: Optional[int] = None,
     fast_dev_run: bool = False,
     num_nodes: Optional[int] = None,
@@ -313,13 +317,16 @@ def optimize(
     batch_size: Optional[int] = None,
     mode: Optional[Literal["append", "overwrite"]] = None,
     use_checkpoint: bool = False,
+    item_loader: Optional[BaseItemLoader] = None,
+    start_method: Optional[str] = None,
 ) -> None:
-    """This function converts a dataset into chunks possibly in a distributed way.
+    """This function converts a dataset into chunks, possibly in a distributed way.
 
-    Arguments:
-        fn: A function to be executed over each input element
-        inputs: A sequence of input to be processed by the `fn` function.
-            Each input should contain at least a valid filepath.
+    Args:
+        fn: A function to be executed over each input element. The function should return the data sample that
+            corresponds to the input. Every invocation of the function should return a similar hierarchy of objects,
+            where the object types and list sizes don't change.
+        inputs: A sequence of input to be processed by the `fn` function, or a streaming dataloader.
         output_dir: The folder where the processed data should be stored.
         input_dir: Provide the path where your files are stored. If the files are on a remote storage,
             they will be downloaded in the background while processed.
@@ -327,12 +334,14 @@ def optimize(
         chunk_size: The maximum number of elements to hold within a chunk.
         chunk_bytes: The maximum number of bytes to hold within a chunk.
         compression: The compression algorithm to use over the chunks.
+        encryption: The encryption algorithm to use over the chunks.
         num_workers: The number of workers to use during processing
         fast_dev_run: Whether to use process only a sub part of the inputs
         num_nodes: When doing remote execution, the number of nodes to use. Only supported on https://lightning.ai/.
         machine: When doing remote execution, the machine to use. Only supported on https://lightning.ai/.
         num_downloaders: The number of downloaders per worker.
         num_uploaders: The numbers of uploaders per worker.
+        reader: The reader to use when reading the data. By default, it uses the `BaseReader`.
         reorder_files: By default, reorders the files by file size to distribute work equally among all workers.
             Set this to ``False`` if the order in which samples are processed should be preserved.
         batch_size: Group the inputs into batches of batch_size length.
@@ -340,8 +349,14 @@ def optimize(
             Defaults to None.
         use_checkpoint: Whether to create checkpoints while processing the data, which can be used to resume the
             processing from the last checkpoint if the process is interrupted. (`Default: False`)
+        item_loader: The item loader that will be used during loading in StreamingDataset. Determines
+                the format in which the data is stored and optimized for loading.
+        start_method: The start method used by python multiprocessing package. Default to spawn unless running
+            inside an interactive shell like Ipython.
 
     """
+    _check_version_and_prompt_upgrade(__version__)
+
     if mode is not None and mode not in ["append", "overwrite"]:
         raise ValueError(f"The provided `mode` should be either `append` or `overwrite`. Found {mode}.")
 
@@ -352,11 +367,12 @@ def optimize(
         raise ValueError("When providing a streaming dataloader, weights isn't supported.")
 
     if not isinstance(inputs, (Sequence, StreamingDataLoader)):
-        raise ValueError(f"The provided inputs should be non empty sequence or a streaming dataloader. Found {inputs}.")
+        raise ValueError(
+            f"The provided inputs should be a non-empty sequence or a streaming dataloader. Found {inputs}."
+        )
 
     if len(inputs) == 0:
         raise ValueError(f"The provided inputs should be non empty. Found {inputs}.")
-
     if chunk_size is None and chunk_bytes is None:
         raise ValueError("Either `chunk_size` or `chunk_bytes` needs to be defined.")
 
@@ -390,7 +406,7 @@ def optimize(
         if _output_dir.url is not None and "cloudspaces" in _output_dir.url:
             raise ValueError(
                 f"The provided `output_dir` isn't valid. Found {_output_dir.path}."
-                " HINT: You can either use `/teamspace/s3_connections/...` or `/teamspace/datasets/...`."
+                "\n HINT: You can either use `/teamspace/s3_connections/...` or `/teamspace/datasets/...`."
             )
 
         _assert_dir_has_index_file(_output_dir, mode=mode, use_checkpoint=use_checkpoint)
@@ -429,6 +445,8 @@ def optimize(
             reader=reader,
             state_dict=state_dict,
             use_checkpoint=use_checkpoint,
+            item_loader=item_loader,
+            start_method=start_method,
         )
 
         with optimize_dns_context(True):
@@ -439,6 +457,7 @@ def optimize(
                     chunk_size=chunk_size,
                     chunk_bytes=chunk_bytes,
                     compression=compression,
+                    encryption=encryption,
                     existing_index=existing_index_file_content,
                 )
             )
@@ -457,7 +476,7 @@ def _listdir(folder: str) -> Tuple[str, List[str]]:
 class walk:
     """This class is an optimized version of os.walk for listing files and folders from cloud filesystem.
 
-    Note: The order of files and folders yielded aren't depth-first anymore due to the asynchronous listing call.
+    .. note:: The order of files and folders yielded aren't depth-first anymore due to the asynchronous listing call.
 
     """
 
@@ -508,13 +527,13 @@ class CopyInfo:
     new_filename: str
 
 
-def merge_datasets(input_dirs: List[str], output_dir: str) -> None:
-    """The merge_datasets utility enables to merge multiple existing optimized datasets into a single optimized
-    dataset.
+def merge_datasets(input_dirs: List[str], output_dir: str, max_workers: Optional[int] = os.cpu_count()) -> None:
+    """Enables to merge multiple existing optimized datasets into a single optimized dataset.
 
-    Arguments:
+    Args:
         input_dirs: A list of directories pointing to the existing optimized datasets.
         output_dir: The directory where the merged dataset would be stored.
+        max_workers: Number of workers for multithreading
 
     """
     if len(input_dirs) == 0:
@@ -525,6 +544,7 @@ def merge_datasets(input_dirs: List[str], output_dir: str) -> None:
 
     resolved_input_dirs = [_resolve_dir(input_dir) for input_dir in input_dirs]
     resolved_output_dir = _resolve_dir(output_dir)
+    max_workers = max_workers or 1
 
     if any(input_dir == resolved_output_dir for input_dir in resolved_input_dirs):
         raise ValueError("The provided output_dir was found within the input_dirs. This isn't supported.")
@@ -552,10 +572,13 @@ def merge_datasets(input_dirs: List[str], output_dir: str) -> None:
     copy_infos: List[CopyInfo] = []
     counter = 0
     for input_dir, input_dir_file_content in zip(resolved_input_dirs, input_dirs_file_content):
+        compression = input_dir_file_content["config"]["compression"]  # type: ignore
         for chunk in input_dir_file_content["chunks"]:  # type: ignore
             assert isinstance(chunk, dict)
             old_filename = chunk["filename"]
-            new_filename = f"chunk-0-{counter}.bin"
+            new_filename = (
+                f"chunk-0-{counter}.{compression}.bin" if compression is not None else f"chunk-0-{counter}.bin"
+            )
             copy_infos.append(CopyInfo(input_dir=input_dir, old_filename=old_filename, new_filename=new_filename))
             chunk["filename"] = new_filename
             chunks.append(chunk)
@@ -563,8 +586,13 @@ def merge_datasets(input_dirs: List[str], output_dir: str) -> None:
 
     index_json = {"config": input_dirs_file_content[0]["config"], "chunks": chunks}  # type: ignore
 
-    for copy_info in _tqdm(copy_infos):
-        _apply_copy(copy_info, resolved_output_dir)
+    _tqdm = _get_tqdm_iterator_if_available()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures: List[concurrent.futures.Future] = []
+        for copy_info in _tqdm(copy_infos):
+            future = executor.submit(_apply_copy, copy_info, resolved_output_dir)
+            futures.append(future)
 
     _save_index(index_json, resolved_output_dir)
 

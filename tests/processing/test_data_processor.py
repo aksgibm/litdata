@@ -9,8 +9,8 @@ from unittest.mock import ANY, Mock
 import numpy as np
 import pytest
 import torch
+from lightning_utilities.core.imports import RequirementCache
 from litdata.constants import _TORCH_AUDIO_AVAILABLE, _ZSTD_AVAILABLE
-from litdata.imports import RequirementCache
 from litdata.processing import data_processor as data_processor_module
 from litdata.processing import functions
 from litdata.processing.data_processor import (
@@ -460,8 +460,7 @@ class TestDataProcessor(DataProcessor):
     condition=(not _PIL_AVAILABLE or sys.platform == "win32" or sys.platform == "linux"), reason="Requires: ['pil']"
 )
 def test_data_processsor_distributed(fast_dev_run, delete_cached_files, tmpdir, monkeypatch):
-    """This test ensures the data optimizer works in a fully distributed settings."""
-
+    """Ensures the data optimizer works in a fully distributed settings."""
     seed_everything(42)
 
     monkeypatch.setattr(data_processor_module.os, "_exit", mock.MagicMock())
@@ -1241,3 +1240,20 @@ def test_data_chunk_recipe():
     data_recipe = DataChunkRecipe(chunk_size=2)
     assert data_recipe.chunk_bytes is None
     assert data_recipe.chunk_size == 2
+
+
+def test_data_processor_start_method(monkeypatch):
+    with pytest.raises(ValueError, match="cannot find context for 'blabla'"):
+        DataProcessor(None, start_method="blabla")
+
+    mp_mock = mock.MagicMock()
+
+    monkeypatch.setattr(data_processor_module, "multiprocessing", mp_mock)
+
+    DataProcessor(None)
+    mp_mock.set_start_method.assert_called_with("spawn", force=True)
+
+    monkeypatch.setattr(data_processor_module, "in_notebook", mock.MagicMock(return_value=True))
+
+    DataProcessor(None)
+    mp_mock.set_start_method.assert_called_with("fork", force=True)

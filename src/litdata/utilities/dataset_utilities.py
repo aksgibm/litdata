@@ -2,23 +2,27 @@ import hashlib
 import json
 import math
 import os
+import shutil
+import tempfile
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from litdata.constants import _DEFAULT_CACHE_DIR, _INDEX_FILENAME
+from litdata.constants import _DEFAULT_CACHE_DIR, _DEFAULT_LIGHTNING_CACHE_DIR, _INDEX_FILENAME
 from litdata.streaming.downloader import get_downloader_cls
 from litdata.streaming.item_loader import BaseItemLoader, TokensLoader
-from litdata.streaming.resolver import Dir
+from litdata.streaming.resolver import Dir, _resolve_dir
 from litdata.utilities.subsample import shuffle_lists_together, subsample_filenames_and_roi
 
 
 def subsample_streaming_dataset(
     input_dir: Dir,
+    cache_dir: Optional[Dir] = None,
     item_loader: Optional[BaseItemLoader] = None,
     subsample: float = 1.0,
     shuffle: bool = False,
     seed: int = 42,
+    storage_options: Optional[Dict] = {},
 ) -> Tuple[List[str], List[Tuple[int, int]]]:
     """Subsample streaming dataset.
 
@@ -35,7 +39,11 @@ def subsample_streaming_dataset(
 
     # Make sure input_dir contains cache path and remote url
     if _should_replace_path(input_dir.path):
-        cache_path = _try_create_cache_dir(input_dir=input_dir.path if input_dir.path else input_dir.url)
+        cache_path = _try_create_cache_dir(
+            input_dir=input_dir.path if input_dir.path else input_dir.url,
+            cache_dir=cache_dir.path if cache_dir else None,
+            storage_options=storage_options,
+        )
         if cache_path is not None:
             input_dir.path = cache_path
 
@@ -46,8 +54,11 @@ def subsample_streaming_dataset(
     # Check if `index.json` file exists in cache path
     if not os.path.exists(cache_index_filepath) and isinstance(input_dir.url, str):
         assert input_dir.url is not None
-        downloader = get_downloader_cls(input_dir.url, input_dir.path, [])
+        downloader = get_downloader_cls(input_dir.url, input_dir.path, [], storage_options)
         downloader.download_file(os.path.join(input_dir.url, _INDEX_FILENAME), cache_index_filepath)
+
+    if not os.path.exists(input_dir.path):
+        raise FileNotFoundError(f"The provided dataset path `{input_dir.path}` does not exist.")
 
     if os.path.exists(os.path.join(input_dir.path, _INDEX_FILENAME)):
         # load chunks from `index.json` file
@@ -56,7 +67,7 @@ def subsample_streaming_dataset(
     else:
         raise ValueError(
             f"The provided dataset `{input_dir.path}` doesn't contain any {_INDEX_FILENAME} file."
-            " HINT: Did you successfully optimize a dataset to the provided `input_dir`?"
+            "\n HINT: Did you successfully optimize a dataset to the provided `input_dir`?"
         )
 
     assert len(original_chunks) > 0, f"No chunks found in the `{input_dir}/index.json` file"
@@ -90,19 +101,74 @@ def _should_replace_path(path: Optional[str]) -> bool:
     return path.startswith("/teamspace/datasets/") or path.startswith("/teamspace/s3_connections/")
 
 
-def _try_create_cache_dir(input_dir: Optional[str]) -> Optional[str]:
-    hash_object = hashlib.md5((input_dir or "").encode())  # noqa: S324
+def _read_updated_at(input_dir: Optional[Dir], storage_options: Optional[Dict] = {}) -> str:
+    """Read last updated timestamp from index.json file."""
+    last_updation_timestamp = "0"
+    index_json_content = None
+    assert isinstance(input_dir, Dir)
+
+    if input_dir.path is not None and os.path.exists(os.path.join(input_dir.path, _INDEX_FILENAME)):
+        # read index.json file and read last_updation_timestamp
+        index_json_content = load_index_file(input_dir.path)
+    elif input_dir.url is not None:
+        assert input_dir.url is not None
+        # download index.json file and read last_updation_timestamp
+        with tempfile.TemporaryDirectory() as tmp_directory:
+            temp_index_filepath = os.path.join(tmp_directory, _INDEX_FILENAME)
+            downloader = get_downloader_cls(input_dir.url, tmp_directory, [], storage_options)
+            downloader.download_file(os.path.join(input_dir.url, _INDEX_FILENAME), temp_index_filepath)
+
+            index_json_content = load_index_file(tmp_directory)
+
+    if index_json_content is not None and "updated_at" in index_json_content:
+        last_updation_timestamp = index_json_content["updated_at"]
+
+    return last_updation_timestamp
+
+
+def _clear_cache_dir_if_updated(input_dir_hash_filepath: str, updated_at_hash: str) -> None:
+    """Clear cache dir if it is updated.
+
+    If last_updated has changed and /cache/chunks/{HASH(input_dir.url)} isn't empty, we remove all the files and then
+    create the cache.
+
+    """
+    if os.path.exists(input_dir_hash_filepath):
+        # check if it only contains one directory with updated_at_hash
+        dir_list = os.listdir(input_dir_hash_filepath)
+        if not (len(dir_list) == 1 and dir_list[0] == updated_at_hash):
+            shutil.rmtree(input_dir_hash_filepath)
+
+
+def _try_create_cache_dir(
+    input_dir: Optional[str],
+    cache_dir: Optional[str] = None,
+    storage_options: Optional[Dict] = {},
+) -> Optional[str]:
+    resolved_input_dir = _resolve_dir(input_dir)
+    updated_at = _read_updated_at(resolved_input_dir, storage_options)
+
+    if updated_at == "0" and input_dir is not None:
+        updated_at = hashlib.md5(input_dir.encode()).hexdigest()  # noqa: S324
+
+    dir_url_hash = hashlib.md5((resolved_input_dir.url or "").encode()).hexdigest()  # noqa: S324
+
     if "LIGHTNING_CLUSTER_ID" not in os.environ or "LIGHTNING_CLOUD_PROJECT_ID" not in os.environ:
-        cache_dir = os.path.join(_DEFAULT_CACHE_DIR, hash_object.hexdigest())
+        input_dir_hash_filepath = os.path.join(cache_dir or _DEFAULT_CACHE_DIR, dir_url_hash)
+        _clear_cache_dir_if_updated(input_dir_hash_filepath, updated_at)
+        cache_dir = os.path.join(input_dir_hash_filepath, updated_at)
         os.makedirs(cache_dir, exist_ok=True)
         return cache_dir
-    cache_dir = os.path.join("/cache", "chunks", hash_object.hexdigest())
+
+    input_dir_hash_filepath = os.path.join(cache_dir or _DEFAULT_LIGHTNING_CACHE_DIR, dir_url_hash)
+    _clear_cache_dir_if_updated(input_dir_hash_filepath, updated_at)
+    cache_dir = os.path.join(input_dir_hash_filepath, updated_at)
     os.makedirs(cache_dir, exist_ok=True)
     return cache_dir
 
 
 def generate_roi(chunks: List[Dict[str, Any]], item_loader: Optional[BaseItemLoader] = None) -> List[Tuple[int, int]]:
-    "Generates default region_of_interest for chunks."
+    """Generates default region_of_interest for chunks."""
     roi = []
 
     if isinstance(item_loader, TokensLoader):
@@ -148,13 +214,14 @@ def load_index_file(input_dir: str) -> Dict[str, Any]:
 
 def adapt_mds_shards_to_chunks(data: Dict[str, Any]) -> Dict[str, Any]:
     """Adapt mds shard-based index data to chunk-based format for compatibility.
-    For more details about MDS, refer to the MosaicML Streaming documentation: https://github.com/mosaicml/streaming
+    For more details about MDS, refer to the MosaicML Streaming documentation: https://github.com/mosaicml/streaming.
 
     Args:
         data (Dict[str, Any]): The original index data containing shards.
 
     Returns:
         Dict[str, Any]: Adapted index data with chunks format.
+
     """
     chunks = []
     shards = data["shards"]
@@ -185,5 +252,6 @@ def adapt_mds_shards_to_chunks(data: Dict[str, Any]) -> Dict[str, Any]:
         "data_format": shards[0]["column_encodings"],
         "format": shards[0]["format"],
         "data_spec": json.dumps(data_spec),
+        "encryption": None,
     }
     return data

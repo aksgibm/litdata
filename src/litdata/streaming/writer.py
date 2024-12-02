@@ -16,17 +16,18 @@ import os
 import uuid
 import warnings
 from dataclasses import dataclass
-from time import sleep
+from time import sleep, time
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
-import torch
 
 from litdata.constants import _INDEX_FILENAME
 from litdata.processing.utilities import get_worker_rank
 from litdata.streaming.compression import _COMPRESSORS, Compressor
+from litdata.streaming.item_loader import BaseItemLoader, PyTreeLoader
 from litdata.streaming.serializers import Serializer, _get_serializers
 from litdata.utilities._pytree import PyTree, tree_flatten, treespec_dumps
+from litdata.utilities.encryption import Encryption, EncryptionLevel
 from litdata.utilities.env import _DistributedEnv, _WorkerEnv
 from litdata.utilities.format import _convert_bytes_to_int, _human_readable_bytes
 
@@ -49,19 +50,24 @@ class BinaryWriter:
         chunk_size: Optional[int] = None,
         chunk_bytes: Optional[Union[int, str]] = None,
         compression: Optional[str] = None,
+        encryption: Optional[Encryption] = None,
         follow_tensor_dimension: bool = True,
         serializers: Optional[Dict[str, Serializer]] = None,
         chunk_index: Optional[int] = None,
+        item_loader: Optional[BaseItemLoader] = None,
     ):
         """The BinaryWriter enables to chunk dataset into an efficient streaming format for cloud training.
 
-        Arguments:
+        Args:
             cache_dir: The path to where the chunks will be saved.
             chunk_bytes: The maximum number of bytes within a chunk.
             chunk_size: The maximum number of items within a chunk.
             compression: The compression algorithm to use.
+            encryption: The encryption algorithm to use.
+            follow_tensor_dimension: Whether to follow the tensor dimension when serializing the data.
             serializers: Provide your own serializers.
             chunk_index: The index of the chunk to start from.
+            item_loader: The object responsible to generate the chunk intervals and load an item from a chunk.
 
         """
         self._cache_dir = cache_dir
@@ -79,13 +85,15 @@ class BinaryWriter:
         self._chunk_size = chunk_size
         self._chunk_bytes = _convert_bytes_to_int(chunk_bytes) if isinstance(chunk_bytes, str) else chunk_bytes
         self._compression = compression
+        self._encryption = encryption
+        self._item_loader = item_loader or PyTreeLoader()
 
         self._data_format: Optional[List[str]] = None
         self._data_spec: Optional[PyTree] = None
 
         if self._compression:
             if len(_COMPRESSORS) == 0:
-                raise ValueError("No compresion algorithms are installed.")
+                raise ValueError("No compression algorithms are installed.")
 
             if self._compression not in _COMPRESSORS:
                 raise ValueError(
@@ -143,17 +151,14 @@ class BinaryWriter:
             "chunk_bytes": self._chunk_bytes,
             "data_format": self._data_format,
             "data_spec": treespec_dumps(self._data_spec) if self._data_spec else None,
+            "encryption": self._encryption.state_dict() if self._encryption else None,
+            "item_loader": self._item_loader.__class__.__name__,
         }
 
     def serialize(self, items: Any) -> Tuple[bytes, Optional[int]]:
         """Serialize a dictionary into its binary format."""
-
         # Flatten the items provided by the users
         flattened, data_spec = tree_flatten(items)
-
-        is_single_tensor = (
-            len(flattened) == 1 and isinstance(flattened[0], torch.Tensor) and len(flattened[0].shape) == 1
-        )
 
         # Collect the sizes and associated bytes for each item
         sizes: List[int] = []
@@ -173,14 +178,7 @@ class BinaryWriter:
             # tiny optimization to avoid looping over all the data format
             self._serialize_with_data_format(flattened, sizes, data, self._data_format)
 
-        # If there is a single element and it is a tensor, enable continous array.
-        if is_single_tensor:
-            return data[0], flattened[0].shape[0]
-
-        # Concatenante into a single byte array
-        head = np.array(sizes, np.uint32).tobytes()
-        body = b"".join(data)
-        return head + body, None
+        return self._item_loader.encode_data(data, sizes, flattened)
 
     def _serialize(self, item: Any, sizes: List[int], data: List[bytes]) -> str:
         """Serialize a given item and append its size and bytes to the sizes and data array."""
@@ -238,6 +236,11 @@ class BinaryWriter:
 
         current_chunk_bytes = sum([item.bytes for item in items])
 
+        # Whether to encrypt the data at the chunk level
+        if self._encryption and self._encryption.level == EncryptionLevel.CHUNK:
+            data = self._encryption.encrypt(data)
+            current_chunk_bytes = len(data)
+
         if self._chunk_bytes and current_chunk_bytes > self._chunk_bytes:
             warnings.warn(
                 f"An item was larger than the target chunk size ({_human_readable_bytes(self._chunk_bytes)})."
@@ -287,12 +290,17 @@ class BinaryWriter:
 
     def add_item(self, index: int, items: Any) -> Optional[str]:
         """Given an index and items will serialize the items and store an Item object to the growing
-        `_serialized_items`."""
-
+        `_serialized_items`.
+        """
         if index in self._serialized_items:
             raise ValueError(f"The provided index {index} already exists in the cache.")
 
         data, dim = self.serialize(items)
+
+        # Whether to encrypt the data at the sample level
+        if self._encryption and self._encryption.level == EncryptionLevel.SAMPLE:
+            data = self._encryption.encrypt(data)
+
         self._serialized_items[index] = Item(
             index=index,
             data=data,
@@ -406,7 +414,8 @@ class BinaryWriter:
 
     def merge(self, num_workers: int = 1, node_rank: Optional[int] = None) -> None:
         """Once all the workers have written their own index, the merge function is responsible to read and merge them
-        into a single index."""
+        into a single index.
+        """
         num_workers = num_workers or 1
 
         # Only for non rank 0
@@ -436,7 +445,7 @@ class BinaryWriter:
         """Once all the workers have written their own index, the merge function is responsible to read and merge them
         into a single index.
 
-        Arguments:
+        Args:
             node_rank: The node rank of the index file
             existing_index: Existing index to be added to the newly created one.
 
@@ -471,7 +480,8 @@ class BinaryWriter:
 
         if node_rank is None:
             with open(os.path.join(self._cache_dir, _INDEX_FILENAME), "w") as f:
-                json.dump({"chunks": chunks_info, "config": config}, f, sort_keys=True)
+                data = {"chunks": chunks_info, "config": config, "updated_at": str(time())}
+                json.dump(data, f, sort_keys=True)
         else:
             with open(os.path.join(self._cache_dir, f"{node_rank}-{_INDEX_FILENAME}"), "w") as f:
                 json.dump({"chunks": chunks_info, "config": config}, f, sort_keys=True)
@@ -503,7 +513,7 @@ class BinaryWriter:
         """Save the current state of the writer to a checkpoint."""
         checkpoint_dir = os.path.join(self._cache_dir, checkpoint_dir)
         if not os.path.exists(checkpoint_dir):
-            os.makedirs(checkpoint_dir)
+            os.makedirs(checkpoint_dir, exist_ok=True)
 
         if self._chunks_info == self.last_checkpoint_chunk_info:
             # to avoid saving the same checkpoint twice

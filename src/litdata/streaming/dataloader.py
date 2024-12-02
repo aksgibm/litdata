@@ -78,13 +78,13 @@ class CacheDataset(Dataset):
         chunk_size: Optional[int],
         compression: Optional[str],
     ):
-        """The `CacheDataset` is a dataset wraper to provide a beginner experience with the Cache.
+        """The `CacheDataset` is a dataset wrapper to provide a beginner experience with the Cache.
 
-        Arguments:
+        Args:
             dataset: The dataset of the user
             cache_dir: The folder where the chunks are written to.
             chunk_bytes: The maximal number of bytes to write within a chunk.
-            chunk_sie: The maximal number of items to write to a chunk.
+            chunk_size: The maximal number of items to write to a chunk.
             compression: The compression algorithm to use to reduce the size of the chunk.
 
         """
@@ -103,7 +103,7 @@ class CacheDataset(Dataset):
                 if not _equal_items(data_1, data2):
                     raise ValueError(
                         f"Your dataset items aren't deterministic. Found {data_1} and {data2} for index {index}."
-                        " HINT: Use the `litdata.cache.Cache` directly within your dataset."
+                        "\n HINT: Use the `litdata.cache.Cache` directly within your dataset."
                     )
                 self._is_deterministic = True
             self._cache[index] = data_1
@@ -115,7 +115,7 @@ class CacheCollateFn:
 
     During the chunking phase, there is no need to return any data from the DataLoader reducing some time.
 
-    Additionally, if the user makes their __getitem__ asynchronous, the collate executes them in parallel.
+    Additionally, if the user makes their __getitem__ asynchronous, collate executes them in parallel.
 
     """
 
@@ -126,7 +126,7 @@ class CacheCollateFn:
         if all(item is None for item in items):
             return None
 
-        # If the __getitem__ method is asynchornous, collect all the items.
+        # If the __getitem__ method is asynchronous, collect all the items.
         if all(inspect.iscoroutine(item) for item in items):
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
@@ -136,7 +136,7 @@ class CacheCollateFn:
 
 
 class _SingleProcessDataLoaderIterPatch(_SingleProcessDataLoaderIter):
-    """This is overriden to inform the cache is done chunking."""
+    """This is ç to inform the cache is done chunking."""
 
     def _next_data(self) -> Any:
         try:
@@ -338,7 +338,7 @@ class CacheDataLoader(DataLoader):
         )
 
     def _get_iterator(self) -> "_BaseDataLoaderIter":
-        """Overriden to ensure the `Cache.done()` method is triggered on iteration done."""
+        """Overridden to ensure the `Cache.done()` method is triggered on iteration done."""
         if self.num_workers == 0:
             return _SingleProcessDataLoaderIterPatch(self)
         self.check_worker_number_rationality()
@@ -555,7 +555,7 @@ class StreamingDataLoader(DataLoader):
         profile_dir: Optional[str] = None,
         prefetch_factor: Optional[int] = None,
         shuffle: Optional[bool] = None,
-        drop_last: Optional[bool] = False,
+        drop_last: Optional[bool] = None,
         collate_fn: Optional[Callable] = None,
         **kwargs: Any,
     ) -> None:  # pyright: ignore
@@ -570,6 +570,9 @@ class StreamingDataLoader(DataLoader):
 
         if drop_last is not None:
             dataset.set_drop_last(drop_last)
+
+        dataset.set_batch_size(batch_size)
+        dataset.set_num_workers(num_workers)
 
         shuffle = None
 
@@ -612,6 +615,7 @@ class StreamingDataLoader(DataLoader):
             self.current_epoch += 1
             self._num_samples_yielded_combined = {}
             self._num_samples_yielded_streaming = 0
+            self.dataset.reset_state_dict()
 
         self.dataset.set_epoch(self.current_epoch)
 
@@ -697,18 +701,28 @@ class StreamingDataLoader(DataLoader):
 
         # Inform we are resuming and disable resetting the StreamingDataLoader state.
         # This is toggle back to False when the `__iter__` method of the StreamingDataLoader completes.
-        self.restore = True
+        # self.restore = True
 
         if isinstance(self.dataset, CombinedStreamingDataset):
             self.dataset._set_use_streaming_dataloader(True)
             self.dataset.load_state_dict(obj)
+
+            # Inform that the dataloader is resuming.
+            # TODO: Check if the number of samples yielded is less than the length of the dataset.
+            # Also, len is not available for CombinedStreamingDataset in case of provided weights.
+            self.restore = True
+
         elif isinstance(self.dataset, StreamingDataset):
             self.dataset.load_state_dict(obj["dataset"])
+
+            # Inform that the dataloader is resuming.
+            if self._num_samples_yielded_streaming < len(self.dataset):
+                self.restore = True
         else:
             raise RuntimeError("The provided dataset should be a `StreamingDataset` or a `CombinedStreamingDataset`.")
 
     def _get_iterator(self) -> "_BaseDataLoaderIter":
-        """Overriden to ensure the `Cache.done()` method is triggered on iteration done."""
+        """Overridden to ensure the `Cache.done()` method is triggered on iteration done."""
         if self.num_workers == 0:
             return _SingleProcessDataLoaderIter(self)
         self.check_worker_number_rationality()

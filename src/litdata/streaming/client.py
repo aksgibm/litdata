@@ -13,33 +13,37 @@
 
 import os
 from time import time
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
-from litdata.constants import _BOTO3_AVAILABLE, _IS_IN_STUDIO
+import boto3
+import botocore
+from botocore.credentials import InstanceMetadataProvider
+from botocore.utils import InstanceMetadataFetcher
 
-if _BOTO3_AVAILABLE:
-    import boto3
-    import botocore
-    from botocore.credentials import InstanceMetadataProvider
-    from botocore.utils import InstanceMetadataFetcher
+from litdata.constants import _IS_IN_STUDIO
 
 
 class S3Client:
     # TODO: Generalize to support more cloud providers.
 
-    def __init__(self, refetch_interval: int = 3300) -> None:
+    def __init__(self, refetch_interval: int = 3300, storage_options: Optional[Dict] = {}) -> None:
         self._refetch_interval = refetch_interval
         self._last_time: Optional[float] = None
         self._client: Optional[Any] = None
+        self._storage_options: dict = storage_options or {}
 
     def _create_client(self) -> None:
         has_shared_credentials_file = (
             os.getenv("AWS_SHARED_CREDENTIALS_FILE") == os.getenv("AWS_CONFIG_FILE") == "/.credentials/.aws_credentials"
         )
 
-        if has_shared_credentials_file or not _IS_IN_STUDIO:
+        if has_shared_credentials_file or not _IS_IN_STUDIO or self._storage_options:
             self._client = boto3.client(
-                "s3", config=botocore.config.Config(retries={"max_attempts": 1000, "mode": "adaptive"})
+                "s3",
+                **{
+                    "config": botocore.config.Config(retries={"max_attempts": 1000, "mode": "adaptive"}),
+                    **self._storage_options,
+                },
             )
         else:
             provider = InstanceMetadataProvider(iam_role_fetcher=InstanceMetadataFetcher(timeout=3600, num_attempts=5))

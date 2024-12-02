@@ -19,9 +19,11 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 from torch.utils.data import IterableDataset
 
+from litdata import __version__
 from litdata.constants import (
     _INDEX_FILENAME,
 )
+from litdata.helpers import _check_version_and_prompt_upgrade
 from litdata.streaming import Cache
 from litdata.streaming.downloader import get_downloader_cls  # noqa: F401
 from litdata.streaming.item_loader import BaseItemLoader
@@ -30,8 +32,12 @@ from litdata.streaming.sampler import ChunkedIndex
 from litdata.streaming.serializers import Serializer
 from litdata.streaming.shuffle import FullShuffle, NoShuffle, Shuffle
 from litdata.utilities.dataset_utilities import _should_replace_path, _try_create_cache_dir, subsample_streaming_dataset
+from litdata.utilities.encryption import Encryption
 from litdata.utilities.env import _DistributedEnv, _is_in_dataloader_worker, _WorkerEnv
-from litdata.utilities.shuffle import _find_chunks_per_ranks_on_which_to_skip_deletion
+from litdata.utilities.shuffle import (
+    _find_chunks_per_workers_on_which_to_skip_deletion,
+    _map_node_worker_rank_to_chunk_indexes_to_not_delete,
+)
 
 logger = Logger(__name__)
 
@@ -42,6 +48,7 @@ class StreamingDataset(IterableDataset):
     def __init__(
         self,
         input_dir: Union[str, "Dir"],
+        cache_dir: Optional[Union[str, "Dir"]] = None,
         item_loader: Optional[BaseItemLoader] = None,
         shuffle: bool = False,
         drop_last: Optional[bool] = None,
@@ -49,11 +56,16 @@ class StreamingDataset(IterableDataset):
         serializers: Optional[Dict[str, Serializer]] = None,
         max_cache_size: Union[int, str] = "100GB",
         subsample: float = 1.0,
+        encryption: Optional[Encryption] = None,
+        storage_options: Optional[Dict] = {},
+        max_pre_download: int = 2,
     ) -> None:
         """The streaming dataset can be used once your data have been optimised using the DatasetOptimiser class.
 
-        Arguments:
+        Args:
             input_dir: Path to the folder where the input data is stored.
+            cache_dir: Path to the folder where the cache data is stored. If not provided, the cache will be stored
+                in the default cache directory.
             item_loader: The logic to load an item from a chunk.
             shuffle: Whether to shuffle the data.
             drop_last: If `True`, drops the last items to ensure that
@@ -64,8 +76,13 @@ class StreamingDataset(IterableDataset):
             serializers: The serializers used to serialize and deserialize the chunks.
             max_cache_size: The maximum cache size used by the StreamingDataset.
             subsample: Float representing fraction of the dataset to be randomly sampled (e.g., 0.1 => 10% of dataset).
+            encryption: The encryption object to use for decrypting the data.
+            storage_options: Additional connection options for accessing storage services.
+            max_pre_download: Maximum number of chunks that can be pre-downloaded by the StreamingDataset.
 
         """
+        _check_version_and_prompt_upgrade(__version__)
+
         super().__init__()
         if not isinstance(shuffle, bool):
             raise ValueError(f"Shuffle should be a boolean. Found {shuffle}")
@@ -74,12 +91,14 @@ class StreamingDataset(IterableDataset):
             raise ValueError("subsample must be a float with value between 0 and 1.")
 
         input_dir = _resolve_dir(input_dir)
+        cache_dir = _resolve_dir(cache_dir)
 
         self.input_dir = input_dir
+        self.cache_dir = cache_dir
         self.subsampled_files: List[str] = []
         self.region_of_interest: List[Tuple[int, int]] = []
         self.subsampled_files, self.region_of_interest = subsample_streaming_dataset(
-            self.input_dir, item_loader, subsample, shuffle, seed
+            self.input_dir, self.cache_dir, item_loader, subsample, shuffle, seed, storage_options
         )
 
         self.item_loader = item_loader
@@ -117,8 +136,13 @@ class StreamingDataset(IterableDataset):
         self.shuffler: Optional[Shuffle] = None
         self.serializers = serializers
         self._state_dict: Optional[Dict[str, Any]] = None
-        self.num_workers: Optional[int] = None
-        self.batch_size: Optional[int] = None
+        # Has slightly different meaning in the context of the dataset
+        # We consider `num_workers = 0` from `torch.utils.DataLoader` still as 1 worker (the main process)
+        self.num_workers: int = 1
+        self.batch_size: int = 1
+        self._encryption = encryption
+        self.storage_options = storage_options
+        self.max_pre_download = max_pre_download
 
     def set_shuffle(self, shuffle: bool) -> None:
         self.shuffle = shuffle
@@ -140,7 +164,8 @@ class StreamingDataset(IterableDataset):
     def _create_cache(self, worker_env: _WorkerEnv) -> Cache:
         if _should_replace_path(self.input_dir.path):
             cache_path = _try_create_cache_dir(
-                input_dir=self.input_dir.path if self.input_dir.path else self.input_dir.url
+                input_dir=self.input_dir.path if self.input_dir.path else self.input_dir.url,
+                cache_dir=self.cache_dir.path,
             )
             if cache_path is not None:
                 self.input_dir.path = cache_path
@@ -153,13 +178,16 @@ class StreamingDataset(IterableDataset):
             chunk_bytes=1,
             serializers=self.serializers,
             max_cache_size=self.max_cache_size,
+            encryption=self._encryption,
+            storage_options=self.storage_options,
+            max_pre_download=self.max_pre_download,
         )
         cache._reader._try_load_config()
 
         if not cache.filled:
             raise ValueError(
                 f"The provided dataset `{self.input_dir}` doesn't contain any {_INDEX_FILENAME} file."
-                " HINT: Did you successfully optimize a dataset to the provided `input_dir`?"
+                "\n HINT: Did you successfully optimize a dataset to the provided `input_dir`?"
             )
 
         return cache
@@ -174,16 +202,22 @@ class StreamingDataset(IterableDataset):
         return FullShuffle(cache, seed, drop_last) if self.shuffle else NoShuffle(cache, seed, drop_last)
 
     def __len__(self) -> int:
-        return self.get_len(1, 1)
+        return self.get_len(self.num_workers, self.batch_size if self.batch_size else 1)
+
+    def set_batch_size(self, batch_size: int) -> None:
+        self.batch_size = batch_size
+
+    def set_num_workers(self, num_workers: int) -> None:
+        self.num_workers = num_workers or 1
 
     def get_len(self, num_workers: int, batch_size: int) -> int:
-        self.num_workers = num_workers
-        self.batch_size = batch_size
+        self.set_num_workers(num_workers)
+        self.set_batch_size(batch_size)
         worker_env = _WorkerEnv.detect()
         if self.shuffler is None:
             cache = self._create_cache(worker_env=worker_env)
             self.shuffler = self._create_shuffler(cache)
-        return self.shuffler.get_len(self.distributed_env, num_workers, batch_size, self.current_epoch)
+        return self.shuffler.get_len(self.distributed_env, self.num_workers, self.batch_size, self.current_epoch)
 
     def __iter__(self) -> "StreamingDataset":
         # When the StreamingDataset is used within map or optimize, let's refetch the distributed env.
@@ -200,35 +234,46 @@ class StreamingDataset(IterableDataset):
             state: Dict[str, Any] = self._state_dict
             self.current_epoch = state["current_epoch"]
 
-        chunks_per_replica, intervals_per_replica = self.shuffler.get_chunks_and_intervals_per_ranks(
-            self.distributed_env, self.worker_env.world_size, self.batch_size or 1, self.current_epoch
+        workers_chunks, workers_intervals = self.shuffler.get_chunks_and_intervals_per_workers(
+            self.distributed_env, self.worker_env.world_size, self.batch_size, self.current_epoch
         )
-        chunks_replica = chunks_per_replica[self.distributed_env.global_rank % self.distributed_env.world_size]
-        intervals_replica = intervals_per_replica[self.distributed_env.global_rank % self.distributed_env.world_size]
+
+        worker_rank = self.distributed_env.global_rank * self.worker_env.world_size + self.worker_env.rank
+        self.worker_chunks = workers_chunks[worker_rank]
+        self.worker_intervals = workers_intervals[worker_rank]
+
+        # The max number of samples to return from `__next__` (in worker)
+        self.stop_length = sum(interval[2] - interval[1] for interval in self.worker_intervals)
 
         # Handle restart
         if self._state_dict:
-            self._resume(chunks_replica, intervals_replica)
+            self._resume(workers_chunks, workers_intervals)
         else:
-            # Find the chunks shared across multiple ranks.
-            # For each shared chunk, find the rank to use the chunk last and prevent deletion
-            # for the other ranks.
-            chunks_indexes_skip_deletion = _find_chunks_per_ranks_on_which_to_skip_deletion(
-                self.worker_env.world_size, chunks_per_replica, intervals_per_replica
+            # Find the chunks shared across all workers of the current node.
+            # For each shared chunk, find the rank and worker to use the chunk last and prevent
+            # premature deletion for the other workers.
+            node_size = self.distributed_env.world_size // self.distributed_env.num_nodes
+            first_rank_this_node = (self.distributed_env.global_rank // node_size) * node_size
+            num_workers_per_node = node_size * self.num_workers
+            worker_start = first_rank_this_node * num_workers_per_node
+            worker_end = worker_start + num_workers_per_node
+            local_rank = self.distributed_env.global_rank % node_size
+
+            chunks_indexes_skip_deletion = _find_chunks_per_workers_on_which_to_skip_deletion(
+                self.num_workers,
+                self.batch_size,
+                workers_chunks[worker_start:worker_end],
+                workers_intervals[worker_start:worker_end],
             )
-            if self.distributed_env.global_rank in chunks_indexes_skip_deletion:
-                self.cache._reader.config.skip_chunk_indexes_deletion = chunks_indexes_skip_deletion[
-                    self.distributed_env.global_rank
+            worker_node_rank_to_chunk_indexes = _map_node_worker_rank_to_chunk_indexes_to_not_delete(
+                chunks_indexes_skip_deletion
+            )
+
+            worker_rank_local_node = local_rank * self.num_workers + self.worker_env.rank
+            if worker_rank_local_node in worker_node_rank_to_chunk_indexes:
+                self.cache._reader.config.skip_chunk_indexes_deletion = worker_node_rank_to_chunk_indexes[
+                    worker_rank_local_node
                 ]
-
-            workers_chunks, workers_intervals = _associate_chunks_to_workers(
-                self.worker_env,
-                chunks_per_replica[self.distributed_env.global_rank],
-                intervals_per_replica[self.distributed_env.global_rank],
-            )
-
-            self.worker_chunks = workers_chunks[self.worker_env.rank]
-            self.worker_intervals = workers_intervals[self.worker_env.rank]
 
             self.num_chunks = len(self.worker_chunks)
             self.current_indexes = []
@@ -241,7 +286,7 @@ class StreamingDataset(IterableDataset):
 
         return self
 
-    def _resume(self, chunks_replica: List[int], intervals_replica: List[Any]) -> None:
+    def _resume(self, workers_chunks: List[List[int]], workers_intervals: List[Any]) -> None:
         assert self._state_dict
         assert self.worker_env
         assert self.shuffler
@@ -254,19 +299,25 @@ class StreamingDataset(IterableDataset):
         # TODO: Implement elastic sampling where the number of workers, ranks can change.
         num_samples_yielded = self._state_dict["num_samples_yielded"]
 
-        # replay sampling from each worker / chunks using the batch size
-        workers_chunks, workers_intervals = _associate_chunks_to_workers(
-            self.worker_env, chunks_replica, intervals_replica
-        )
-        indexes = _replay_sampling(num_samples_yielded, batch_size, num_workers)
-        chunks_index, indexes = _replay_chunks_sampling(workers_intervals, indexes)
-        if any([len(workers_intervals[worker_idx]) <= chunks_index[worker_idx] for worker_idx in range(num_workers)]):
-            chunks_index, indexes = _replay_chunks_sampling_residual_case(workers_intervals, num_samples_yielded)
+        worker_start = self.distributed_env.global_rank * num_workers
+        worker_end = worker_start + num_workers
 
+        # replay sampling from each worker / chunks using the batch size
+        indexes = _replay_sampling(num_samples_yielded, batch_size, num_workers)
+        chunks_index, indexes = _replay_chunks_sampling(
+            workers_intervals={i: workers_intervals[j] for i, j in enumerate(range(worker_start, worker_end))},
+            indexes=indexes,
+        )
+        workers_intervals_ = [workers_intervals[i] for i in range(worker_start,worker_end)]
+        if any([len(workers_intervals_[worker_idx]) <= chunks_index[worker_idx] for worker_idx in range(num_workers)]):
+            chunks_index, indexes = _replay_chunks_sampling_residual_case(workers_intervals_, num_samples_yielded)
+    
         # select the chunks and intervals associated to this worker
-        worker_rank = self.worker_env.rank
+        worker_rank = self.distributed_env.global_rank * self.worker_env.world_size + self.worker_env.rank
+        worker_local_rank = self.worker_env.rank
+
         self.num_chunks = len(workers_intervals[worker_rank])
-        self.chunk_index = chunks_index[worker_rank]
+        self.chunk_index = chunks_index[worker_local_rank]
         self.worker_chunks = workers_chunks[worker_rank]
         self.worker_intervals = workers_intervals[worker_rank]
 
@@ -278,10 +329,10 @@ class StreamingDataset(IterableDataset):
         current_indexes = self.shuffler(current_indexes, self.num_chunks, self.current_epoch, self.chunk_index)
 
         # skip any indexes already consumed
-        current_indexes = current_indexes[indexes[worker_rank] :]
+        current_indexes = current_indexes[indexes[worker_local_rank] :]
         self.current_indexes = current_indexes
 
-        self.global_index = num_samples_yielded
+        self.global_index = indexes[worker_local_rank]
 
         # bump the chunk_index
         self.chunk_index += 1
@@ -302,16 +353,16 @@ class StreamingDataset(IterableDataset):
 
     def __next__(self) -> Any:
         # Prevent to create more batch on a given process
-        if self.global_index >= len(self):
+        if self.global_index >= self.stop_length:
             self.current_epoch += 1
-            self.state_dict = None
+            self.reset_state_dict()
             raise StopIteration
 
         # Lazily re-populate the interval to reduce memory usage.
         if len(self.current_indexes) == 0:
             if self.chunk_index == self.num_chunks:
                 self.current_epoch += 1
-                self.state_dict = None
+                self.reset_state_dict()
                 raise StopIteration
 
             # reset index
@@ -356,11 +407,12 @@ class StreamingDataset(IterableDataset):
 
         return {
             "num_samples_yielded": num_samples_yielded,
-            "num_workers": num_workers,
+            "num_workers": num_workers or 1,
             "batch_size": batch_size,
             "current_epoch": self.current_epoch,
             "input_dir_path": self.input_dir.path,
             "input_dir_url": self.input_dir.url,
+            "cache_dir_path": self.cache_dir.path,
             "item_loader": self.item_loader.state_dict() if self.item_loader else None,
             "drop_last": self.drop_last,
             "seed": self.seed,
@@ -375,13 +427,15 @@ class StreamingDataset(IterableDataset):
             # the state is restored within the workers
             self._state_dict = state_dict
 
+    def reset_state_dict(self) -> None:
+        self._state_dict = None
+
     def _validate_state_dict(self) -> None:
         assert self._state_dict
         assert self.worker_env
         assert self.cache
 
         state: Dict[str, Any] = self._state_dict
-
         if state["shuffle"] != self.shuffle:
             raise ValueError(
                 "The provided `shuffle` state doesn't match the current one. "
@@ -398,7 +452,8 @@ class StreamingDataset(IterableDataset):
         # In this case, validate the cache folder is the same.
         if _should_replace_path(state["input_dir_path"]):
             cache_path = _try_create_cache_dir(
-                input_dir=state["input_dir_path"] if state["input_dir_path"] else state["input_dir_url"]
+                input_dir=state["input_dir_path"] if state["input_dir_path"] else state["input_dir_url"],
+                cache_dir=state.get("cache_dir_path"),
             )
             if cache_path != self.input_dir.path:
                 raise ValueError(
@@ -435,6 +490,12 @@ class StreamingDataset(IterableDataset):
                 f"Found `{self.drop_last}` instead of `{state['drop_last']}`."
             )
 
+        if state["num_samples_yielded"] > len(self):
+            raise ValueError(
+                "The provided `num_samples_yielded` state is greater than the dataset length. "
+                f"Found `{state['num_samples_yielded']}` instead of `{len(self)}`."
+            )
+
     def reset(self) -> None:
         # undo all the properties associated with original dataset
         default_properties: Dict[str, Any] = {
@@ -453,8 +514,8 @@ class StreamingDataset(IterableDataset):
             "random_state": None,
             "shuffler": None,
             "_state_dict": None,
-            "num_workers": None,
-            "batch_size": None,
+            "num_workers": 1,
+            "batch_size": 1,
         }
 
         for prop, value in default_properties.items():
@@ -467,28 +528,6 @@ def is_integer(value: str) -> bool:
         return True
     except Exception:
         return False
-
-
-def _associate_chunks_to_workers(
-    worker_env: _WorkerEnv, chunks_replica: List[int], intervals_replica: List[Any]
-) -> Any:
-    workers_chunks = {}
-    workers_intervals = {}
-
-    for worker_idx in range(worker_env.world_size):
-        worker_chunks = []
-        worker_intervals = []
-        for i, (chunk_index, chunk_interval) in enumerate(zip(chunks_replica, intervals_replica)):
-            if i % worker_env.world_size != worker_idx:
-                continue
-
-            worker_chunks.append(chunk_index)
-            worker_intervals.append(chunk_interval)
-
-        workers_chunks[worker_idx] = worker_chunks
-        workers_intervals[worker_idx] = worker_intervals
-
-    return workers_chunks, workers_intervals
 
 
 def _replay_sampling(num_samples_yielded: int, batch_size: int, num_workers: int) -> Dict[int, int]:

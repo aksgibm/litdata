@@ -21,23 +21,11 @@ from subprocess import DEVNULL, Popen
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from urllib import parse
 
-from litdata.constants import _INDEX_FILENAME, _IS_IN_STUDIO, _LIGHTNING_CLOUD_AVAILABLE
+import boto3
+import botocore
+
+from litdata.constants import _INDEX_FILENAME, _IS_IN_STUDIO
 from litdata.streaming.cache import Dir
-
-if _LIGHTNING_CLOUD_AVAILABLE:
-    from lightning_cloud.openapi import (
-        ProjectIdDatasetsBody,
-    )
-    from lightning_cloud.openapi.rest import ApiException
-    from lightning_cloud.rest_client import LightningClient
-
-try:
-    import boto3
-    import botocore
-
-    _BOTO3_AVAILABLE = True
-except Exception:
-    _BOTO3_AVAILABLE = False
 
 
 def _create_dataset(
@@ -58,7 +46,7 @@ def _create_dataset(
     project_id = os.getenv("LIGHTNING_CLOUD_PROJECT_ID", None)
     cluster_id = os.getenv("LIGHTNING_CLUSTER_ID", None)
     user_id = os.getenv("LIGHTNING_USER_ID", None)
-    cloud_space_id = os.getenv("LIGHTNING_CLOUD_SPACE_ID", None)
+    studio_id = os.getenv("LIGHTNING_CLOUD_SPACE_ID", None)
     lightning_app_id = os.getenv("LIGHTNING_CLOUD_APP_ID", None)
 
     if project_id is None:
@@ -67,12 +55,16 @@ def _create_dataset(
     if not storage_dir:
         raise ValueError("The storage_dir should be defined.")
 
+    from lightning_sdk.lightning_cloud.openapi import ProjectIdDatasetsBody
+    from lightning_sdk.lightning_cloud.openapi.rest import ApiException
+    from lightning_sdk.lightning_cloud.rest_client import LightningClient
+
     client = LightningClient(retry=False)
 
     try:
         client.dataset_service_create_dataset(
             body=ProjectIdDatasetsBody(
-                cloud_space_id=cloud_space_id if lightning_app_id is None else None,
+                cloud_space_id=studio_id if lightning_app_id is None else None,
                 cluster_id=cluster_id,
                 creator_id=user_id,
                 empty=empty,
@@ -259,7 +251,6 @@ def remove_uuid_from_filename(filepath: str) -> str:
         -> `checkpoint-0.json`
 
     """
-
     if not filepath.__contains__(".checkpoints"):
         return filepath
 

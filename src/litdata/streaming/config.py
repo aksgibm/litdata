@@ -33,17 +33,19 @@ class ChunksConfig:
         item_loader: Optional[BaseItemLoader] = None,
         subsampled_files: Optional[List[str]] = None,
         region_of_interest: Optional[List[Tuple[int, int]]] = None,
+        storage_options: Optional[Dict] = {},
     ) -> None:
-        """The ChunksConfig reads the index files associated a chunked dataset and enables to map an index to its
-        chunk.
+        """Reads the index files associated a chunked dataset and enables to map an index to its chunk.
 
         Arguments:
             cache_dir: The path to cache folder.
             serializers: The serializers used to serialize and deserialize the chunks.
             remote_dir: The path to a remote folder where the data are located.
                 The scheme needs to be added to the path.
+            item_loader: The item loader used to load the data from the chunks.
             subsampled_files: List of subsampled chunk files loaded from `input_dir/index.json` file.
             region_of_interest: List of tuples of {start,end} of region of interest for each chunk.
+            storage_options: Additional connection options for accessing storage services.
 
         """
         self._cache_dir = cache_dir
@@ -52,6 +54,7 @@ class ChunksConfig:
         self._chunks = None
         self._remote_dir = remote_dir
         self._item_loader = item_loader or PyTreeLoader()
+        self._storage_options = storage_options
 
         # load data from `index.json` file
         data = load_index_file(self._cache_dir)
@@ -75,12 +78,20 @@ class ChunksConfig:
         self._downloader = None
 
         if remote_dir:
-            self._downloader = get_downloader_cls(remote_dir, cache_dir, self._chunks)
+            self._downloader = get_downloader_cls(remote_dir, cache_dir, self._chunks, self._storage_options)
 
         self._compressor_name = self._config["compression"]
         self._compressor: Optional[Compressor] = None
 
-        if self._compressor_name in _COMPRESSORS:
+        if self._compressor_name:
+            if len(_COMPRESSORS) == 0:
+                raise ValueError(
+                    "No compression algorithms are installed. To use zstd compression,  run `pip install zstd`."
+                )
+            if self._compressor_name not in _COMPRESSORS:
+                raise ValueError(
+                    f"The provided compression {self._compressor_name} isn't available in {sorted(_COMPRESSORS)}",
+                )
             self._compressor = _COMPRESSORS[self._compressor_name]
 
         self._skip_chunk_indexes_deletion: Optional[List[int]] = None
@@ -215,7 +226,12 @@ class ChunksConfig:
 
         begin = self._intervals[index.chunk_index][0]
 
-        return local_chunkpath, begin, chunk["chunk_bytes"]
+        filesize_bytes = chunk["chunk_bytes"]
+
+        if self._config and self._config.get("encryption") is None:
+            filesize_bytes += (1 + chunk["chunk_size"]) * 4
+
+        return local_chunkpath, begin, filesize_bytes
 
     def _get_chunk_index_from_filename(self, chunk_filename: str) -> int:
         """Retrieves the associated chunk_index for a given chunk filename."""
@@ -234,29 +250,37 @@ class ChunksConfig:
         item_loader: Optional[BaseItemLoader] = None,
         subsampled_files: Optional[List[str]] = None,
         region_of_interest: Optional[List[Tuple[int, int]]] = None,
+        storage_options: Optional[dict] = {},
     ) -> Optional["ChunksConfig"]:
         cache_index_filepath = os.path.join(cache_dir, _INDEX_FILENAME)
 
         if isinstance(remote_dir, str):
-            downloader = get_downloader_cls(remote_dir, cache_dir, [])
+            downloader = get_downloader_cls(remote_dir, cache_dir, [], storage_options)
             downloader.download_file(os.path.join(remote_dir, _INDEX_FILENAME), cache_index_filepath)
 
         if not os.path.exists(cache_index_filepath):
             return None
 
-        return ChunksConfig(cache_dir, serializers, remote_dir, item_loader, subsampled_files, region_of_interest)
+        return ChunksConfig(
+            cache_dir, serializers, remote_dir, item_loader, subsampled_files, region_of_interest, storage_options
+        )
 
     def __len__(self) -> int:
         return self._length
 
     def _validate_item_loader(self) -> None:
         assert self._config
-        if (
-            len(self._config["data_format"]) == 1
-            and self._config["data_format"][0].startswith("no_header_tensor")
-            and not isinstance(self._item_loader, TokensLoader)
-        ):
-            raise ValueError("Please, use Cache(..., item_loader=TokensLoader(block_size=...))")
+        if "item_loader" in self._config:
+            if self._item_loader.__class__.__name__ != self._config["item_loader"]:
+                item_loader = self._config["item_loader"]
+                raise ValueError(f"Please, use Cache(..., item_loader={item_loader}(...))")
+        else:
+            if (
+                len(self._config["data_format"]) == 1
+                and self._config["data_format"][0].startswith("no_header_tensor")
+                and not isinstance(self._item_loader, TokensLoader)
+            ):
+                raise ValueError("Please, use Cache(..., item_loader=TokensLoader(block_size=...))")
 
 
 def load_subsampled_chunks(subsampled_files: List[str], original_chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

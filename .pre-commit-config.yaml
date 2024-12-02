@@ -37,25 +37,7 @@ repos:
       - id: check-case-conflict
       - id: check-added-large-files
         args: ["--maxkb=350", "--enforce-all"]
-        exclude: |
-          (?x)^(
-              docs/source-pytorch/_static/images/general/fast_2.gif|
-              docs/source-pytorch/_static/images/mnist_imgs/pt_to_pl.jpg|
-              docs/source-pytorch/_static/images/lightning_module/pt_to_pl.png|
-              docs/source-pytorch/_static/images/general/pl_quick_start_full_compressed.gif|
-              docs/source-pytorch/_static/images/general/pl_overview_flat.jpg|
-              docs/source-pytorch/_static/images/general/pl_overview.gif|
-              src/lightning/fabric/CHANGELOG.md|
-              src/lightning/pytorch/CHANGELOG.md
-          )$
       - id: detect-private-key
-
-  - repo: https://github.com/asottile/pyupgrade
-    rev: v3.15.1
-    hooks:
-      - id: pyupgrade
-        args: ["--py38-plus"]
-        name: Upgrade code
 
   - repo: https://github.com/codespell-project/codespell
     rev: v2.2.6
@@ -64,19 +46,12 @@ repos:
         additional_dependencies: [tomli]
         #args: ["--write-changes"] # uncomment if you want to get automatic fixing
 
-  - repo: https://github.com/PyCQA/docformatter
-    rev: v1.7.5
-    hooks:
-      - id: docformatter
-        additional_dependencies: [tomli]
-        args: ["--in-place"]
-
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.3.2
     hooks:
-      - id: ruff-format
       - id: ruff
-        args: ["--fix", "--preview"]
+        args: ["--fix"]
+      - id: ruff-format
 
   - repo: https://github.com/executablebooks/mdformat
     rev: 0.7.17
@@ -86,15 +61,13 @@ repos:
           - mdformat-gfm
           #- mdformat-black
           - mdformat_frontmatter
-        exclude: |
-          (?x)^(
-              src/data/CHANGELOG.md|
-              README.md
-          )$
+        args: ["--number"]
+        exclude: README.md
 
   - repo: https://github.com/pre-commit/mirrors-prettier
-    rev: v4.0.0-alpha.8
+    rev: v3.1.0
     hooks:
       - id: prettier
+        files: \.(json|yml|yaml|toml)
         # https://prettier.io/docs/en/options.html#print-width
         args: ["--print-width=120"]

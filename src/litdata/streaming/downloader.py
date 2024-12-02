@@ -11,31 +11,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import os
 import shutil
 import subprocess
 from abc import ABC
-from typing import Any, Dict, List
+from contextlib import suppress
+from typing import Any, Dict, List, Optional
 from urllib import parse
 
 from filelock import FileLock, Timeout
 
-from litdata.constants import _GOOGLE_STORAGE_AVAILABLE, _INDEX_FILENAME
+from litdata.constants import _AZURE_STORAGE_AVAILABLE, _GOOGLE_STORAGE_AVAILABLE, _INDEX_FILENAME
 from litdata.streaming.client import S3Client
-
-if _GOOGLE_STORAGE_AVAILABLE:
-    from google.cloud import storage
-else:
-
-    class storage:  # type: ignore
-        Client = None
 
 
 class Downloader(ABC):
-    def __init__(self, remote_dir: str, cache_dir: str, chunks: List[Dict[str, Any]]):
+    def __init__(
+        self, remote_dir: str, cache_dir: str, chunks: List[Dict[str, Any]], storage_options: Optional[Dict] = {}
+    ):
         self._remote_dir = remote_dir
         self._cache_dir = cache_dir
         self._chunks = chunks
+        self._storage_options = storage_options or {}
 
     def download_chunk_from_index(self, chunk_index: int) -> None:
         chunk_filename = self._chunks[chunk_index]["filename"]
@@ -48,12 +46,14 @@ class Downloader(ABC):
 
 
 class S3Downloader(Downloader):
-    def __init__(self, remote_dir: str, cache_dir: str, chunks: List[Dict[str, Any]]):
-        super().__init__(remote_dir, cache_dir, chunks)
+    def __init__(
+        self, remote_dir: str, cache_dir: str, chunks: List[Dict[str, Any]], storage_options: Optional[Dict] = {}
+    ):
+        super().__init__(remote_dir, cache_dir, chunks, storage_options)
         self._s5cmd_available = os.system("s5cmd > /dev/null 2>&1") == 0
 
         if not self._s5cmd_available:
-            self._client = S3Client()
+            self._client = S3Client(storage_options=self._storage_options)
 
     def download_file(self, remote_filepath: str, local_filepath: str) -> None:
         obj = parse.urlparse(remote_filepath)
@@ -64,41 +64,49 @@ class S3Downloader(Downloader):
         if os.path.exists(local_filepath):
             return
 
-        try:
-            with FileLock(local_filepath + ".lock", timeout=3 if obj.path.endswith(_INDEX_FILENAME) else 0):
-                if self._s5cmd_available:
-                    proc = subprocess.Popen(
-                        f"s5cmd cp {remote_filepath} {local_filepath}",
-                        shell=True,
-                        stdout=subprocess.PIPE,
+        with suppress(Timeout), FileLock(
+            local_filepath + ".lock", timeout=3 if obj.path.endswith(_INDEX_FILENAME) else 0
+        ):
+            if self._s5cmd_available:
+                env = None
+                if self._storage_options:
+                    env = os.environ.copy()
+                    env.update(self._storage_options)
+                proc = subprocess.Popen(
+                    f"s5cmd cp {remote_filepath} {local_filepath}",
+                    shell=True,
+                    stdout=subprocess.PIPE,
+                    env=env,
+                )
+                proc.wait()
+            else:
+                from boto3.s3.transfer import TransferConfig
+
+                extra_args: Dict[str, Any] = {}
+
+                if not os.path.exists(local_filepath):
+                    # Issue: https://github.com/boto/boto3/issues/3113
+                    self._client.client.download_file(
+                        obj.netloc,
+                        obj.path.lstrip("/"),
+                        local_filepath,
+                        ExtraArgs=extra_args,
+                        Config=TransferConfig(use_threads=False),
                     )
-                    proc.wait()
-                else:
-                    from boto3.s3.transfer import TransferConfig
-
-                    extra_args: Dict[str, Any] = {}
-
-                    # try:
-                    #     with FileLock(local_filepath + ".lock", timeout=1):
-                    if not os.path.exists(local_filepath):
-                        # Issue: https://github.com/boto/boto3/issues/3113
-                        self._client.client.download_file(
-                            obj.netloc,
-                            obj.path.lstrip("/"),
-                            local_filepath,
-                            ExtraArgs=extra_args,
-                            Config=TransferConfig(use_threads=False),
-                        )
-        except Timeout:
-            # another process is responsible to download that file, continue
-            pass
 
 
 class GCPDownloader(Downloader):
-    def __init__(self, remote_dir: str, cache_dir: str, chunks: List[Dict[str, Any]]):
-        super().__init__(remote_dir, cache_dir, chunks)
+    def __init__(
+        self, remote_dir: str, cache_dir: str, chunks: List[Dict[str, Any]], storage_options: Optional[Dict] = {}
+    ):
+        if not _GOOGLE_STORAGE_AVAILABLE:
+            raise ModuleNotFoundError(str(_GOOGLE_STORAGE_AVAILABLE))
+
+        super().__init__(remote_dir, cache_dir, chunks, storage_options)
 
     def download_file(self, remote_filepath: str, local_filepath: str) -> None:
+        from google.cloud import storage
+
         obj = parse.urlparse(remote_filepath)
 
         if obj.scheme != "gs":
@@ -107,21 +115,51 @@ class GCPDownloader(Downloader):
         if os.path.exists(local_filepath):
             return
 
-        try:
-            with FileLock(local_filepath + ".lock", timeout=3 if obj.path.endswith(_INDEX_FILENAME) else 0):
-                bucket_name = obj.netloc
-                key = obj.path
-                # Remove the leading "/":
-                if key[0] == "/":
-                    key = key[1:]
+        with suppress(Timeout), FileLock(
+            local_filepath + ".lock", timeout=3 if obj.path.endswith(_INDEX_FILENAME) else 0
+        ):
+            bucket_name = obj.netloc
+            key = obj.path
+            # Remove the leading "/":
+            if key[0] == "/":
+                key = key[1:]
 
-                client = storage.Client()
-                bucket = client.bucket(bucket_name)
-                blob = bucket.blob(key)
-                blob.download_to_filename(local_filepath)
-        except Timeout:
-            # another process is responsible to download that file, continue
-            pass
+            client = storage.Client(**self._storage_options)
+            bucket = client.bucket(bucket_name)
+            blob = bucket.blob(key)
+            blob.download_to_filename(local_filepath)
+
+
+class AzureDownloader(Downloader):
+    def __init__(
+        self, remote_dir: str, cache_dir: str, chunks: List[Dict[str, Any]], storage_options: Optional[Dict] = {}
+    ):
+        if not _AZURE_STORAGE_AVAILABLE:
+            raise ModuleNotFoundError(str(_AZURE_STORAGE_AVAILABLE))
+
+        super().__init__(remote_dir, cache_dir, chunks, storage_options)
+
+    def download_file(self, remote_filepath: str, local_filepath: str) -> None:
+        from azure.storage.blob import BlobServiceClient
+
+        obj = parse.urlparse(remote_filepath)
+
+        if obj.scheme != "azure":
+            raise ValueError(
+                f"Expected obj.scheme to be `azure`, instead, got {obj.scheme} for remote={remote_filepath}"
+            )
+
+        if os.path.exists(local_filepath):
+            return
+
+        with suppress(Timeout), FileLock(
+            local_filepath + ".lock", timeout=3 if obj.path.endswith(_INDEX_FILENAME) else 0
+        ):
+            service = BlobServiceClient(**self._storage_options)
+            blob_client = service.get_blob_client(container=obj.netloc, blob=obj.path.lstrip("/"))
+            with open(local_filepath, "wb") as download_file:
+                blob_data = blob_client.download_blob()
+                blob_data.readinto(download_file)
 
 
 class LocalDownloader(Downloader):
@@ -129,8 +167,17 @@ class LocalDownloader(Downloader):
         if not os.path.exists(remote_filepath):
             raise FileNotFoundError(f"The provided remote_path doesn't exist: {remote_filepath}")
 
-        if remote_filepath != local_filepath and not os.path.exists(local_filepath):
-            shutil.copy(remote_filepath, local_filepath)
+        with suppress(Timeout), FileLock(
+            local_filepath + ".lock", timeout=3 if remote_filepath.endswith(_INDEX_FILENAME) else 0
+        ):
+            if remote_filepath == local_filepath or os.path.exists(local_filepath):
+                return
+            # make an atomic operation to be safe
+            temp_file_path = local_filepath + ".tmp"
+            shutil.copy(remote_filepath, temp_file_path)
+            os.rename(temp_file_path, local_filepath)
+            with contextlib.suppress(Exception):
+                os.remove(local_filepath + ".lock")
 
 
 class LocalDownloaderWithCache(LocalDownloader):
@@ -139,11 +186,19 @@ class LocalDownloaderWithCache(LocalDownloader):
         super().download_file(remote_filepath, local_filepath)
 
 
-_DOWNLOADERS = {"s3://": S3Downloader, "gs://": GCPDownloader, "local:": LocalDownloaderWithCache, "": LocalDownloader}
+_DOWNLOADERS = {
+    "s3://": S3Downloader,
+    "gs://": GCPDownloader,
+    "azure://": AzureDownloader,
+    "local:": LocalDownloaderWithCache,
+    "": LocalDownloader,
+}
 
 
-def get_downloader_cls(remote_dir: str, cache_dir: str, chunks: List[Dict[str, Any]]) -> Downloader:
+def get_downloader_cls(
+    remote_dir: str, cache_dir: str, chunks: List[Dict[str, Any]], storage_options: Optional[Dict] = {}
+) -> Downloader:
     for k, cls in _DOWNLOADERS.items():
         if str(remote_dir).startswith(k):
-            return cls(remote_dir, cache_dir, chunks)
+            return cls(remote_dir, cache_dir, chunks, storage_options)
     raise ValueError(f"The provided `remote_dir` {remote_dir} doesn't have a downloader associated.")

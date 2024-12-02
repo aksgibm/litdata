@@ -1,10 +1,16 @@
+import sys
+import threading
+from types import ModuleType
+from unittest.mock import Mock
+
 import pytest
 import torch.distributed
+from litdata.streaming.reader import PrepareChunksThread
 
 
 @pytest.fixture(autouse=True)
 def teardown_process_group():  # noqa: PT004
-    """Ensures that the distributed process group gets closed before the next test runs."""
+    """Ensures distributed process group gets closed before the next test runs."""
     yield
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         torch.distributed.destroy_process_group()
@@ -30,3 +36,75 @@ def mosaic_mds_index_data():
         ],
         "version": 2,
     }
+
+
+@pytest.fixture()
+def google_mock(monkeypatch):
+    google = ModuleType("google")
+    monkeypatch.setitem(sys.modules, "google", google)
+    google_cloud = ModuleType("cloud")
+    monkeypatch.setitem(sys.modules, "google.cloud", google_cloud)
+    google_cloud_storage = ModuleType("storage")
+    monkeypatch.setitem(sys.modules, "google.cloud.storage", google_cloud_storage)
+    google.cloud = google_cloud
+    google.cloud.storage = google_cloud_storage
+    return google
+
+
+@pytest.fixture()
+def azure_mock(monkeypatch):
+    azure = ModuleType("azure")
+    monkeypatch.setitem(sys.modules, "azure", azure)
+    azure_storage = ModuleType("storage")
+    monkeypatch.setitem(sys.modules, "azure.storage", azure_storage)
+    azure_storage_blob = ModuleType("storage")
+    monkeypatch.setitem(sys.modules, "azure.storage.blob", azure_storage_blob)
+    azure.storage = azure_storage
+    azure.storage.blob = azure_storage_blob
+    return azure
+
+
+@pytest.fixture()
+def lightning_cloud_mock(monkeypatch):
+    lightning_cloud = ModuleType("lightning_sdk.lightning_cloud")
+    monkeypatch.setitem(sys.modules, "lightning_sdk.lightning_cloud", lightning_cloud)
+    rest_client = ModuleType("rest_client")
+    monkeypatch.setitem(sys.modules, "lightning_sdk.lightning_cloud.rest_client", rest_client)
+    lightning_cloud.rest_client = rest_client
+    rest_client.LightningClient = Mock()
+    return lightning_cloud
+
+
+@pytest.fixture()
+def lightning_sdk_mock(monkeypatch):
+    lightning_sdk = ModuleType("lightning_sdk")
+    monkeypatch.setitem(sys.modules, "lightning_sdk", lightning_sdk)
+    return lightning_sdk
+
+
+@pytest.fixture(autouse=True)
+def _thread_police():
+    """Attempts stopping left-over threads to avoid test interactions.
+
+    Adapted from PyTorch Lightning.
+
+    """
+    active_threads_before = set(threading.enumerate())
+    yield
+    active_threads_after = set(threading.enumerate())
+
+    for thread in active_threads_after - active_threads_before:
+        if isinstance(thread, PrepareChunksThread):
+            thread.force_stop()
+            continue
+
+        stop = getattr(thread, "stop", None) or getattr(thread, "exit", None)
+        if thread.daemon and callable(stop):
+            # A daemon thread would anyway be stopped at the end of a program
+            # We do it preemptively here to reduce the risk of interactions with other tests that run after
+            stop()
+            assert not thread.is_alive()
+        elif thread.name == "QueueFeederThread":
+            thread.join(timeout=20)
+        else:
+            raise AssertionError(f"Test left zombie thread: {thread}")

@@ -13,27 +13,29 @@
 
 import os
 from pathlib import Path
+from typing import Dict
 
 import numpy as np
 import torch
-
-from litdata.imports import RequirementCache
+from lightning_utilities.core.imports import RequirementCache
 
 _INDEX_FILENAME = "index.json"
 _DEFAULT_CHUNK_BYTES = 1 << 26  # 64M B
 _DEFAULT_FAST_DEV_RUN_ITEMS = 10
 _DEFAULT_CACHE_DIR = os.path.join(Path.home(), ".lightning", "chunks")
+_DEFAULT_LIGHTNING_CACHE_DIR = os.path.join("/cache", "chunks")
 
 # This is required for full pytree serialization / deserialization support
 _TORCH_GREATER_EQUAL_2_1_0 = RequirementCache("torch>=2.1.0")
 _VIZ_TRACKER_AVAILABLE = RequirementCache("viztracer")
-_LIGHTNING_CLOUD_AVAILABLE = RequirementCache("lightning-cloud")
 _BOTO3_AVAILABLE = RequirementCache("boto3")
 _TORCH_AUDIO_AVAILABLE = RequirementCache("torchaudio")
 _ZSTD_AVAILABLE = RequirementCache("zstd")
+_CRYPTOGRAPHY_AVAILABLE = RequirementCache("cryptography")
 _GOOGLE_STORAGE_AVAILABLE = RequirementCache("google.cloud.storage")
+_AZURE_STORAGE_AVAILABLE = RequirementCache("azure.storage.blob")
 _TQDM_AVAILABLE = RequirementCache("tqdm")
-
+_LIGHTNING_SDK_AVAILABLE = RequirementCache("lightning_sdk")
 
 # DON'T CHANGE ORDER
 _TORCH_DTYPES_MAPPING = {
@@ -59,8 +61,27 @@ _TORCH_DTYPES_MAPPING = {
     19: torch.bool,
 }
 
-_NUMPY_SCTYPES = [v for values in np.sctypes.values() for v in values]
-_NUMPY_DTYPES_MAPPING = {i: np.dtype(v) for i, v in enumerate(_NUMPY_SCTYPES)}
+_NUMPY_SCTYPES = [  # All NumPy scalar types from np.core.sctypes.values()
+    np.int8,
+    np.int16,
+    np.int32,
+    np.int64,
+    np.uint8,
+    np.uint16,
+    np.uint32,
+    np.uint64,
+    np.float16,
+    np.float32,
+    np.float64,
+    np.complex64,
+    np.complex128,
+    bool,
+    object,
+    bytes,
+    str,
+    np.void,
+]
+_NUMPY_DTYPES_MAPPING: Dict[int, np.dtype] = {i: np.dtype(v) for i, v in enumerate(_NUMPY_SCTYPES)}
 
 _TIME_FORMAT = "%Y-%m-%d_%H-%M-%S.%fZ"
 _IS_IN_STUDIO = bool(os.getenv("LIGHTNING_CLOUD_PROJECT_ID", None)) and bool(os.getenv("LIGHTNING_CLUSTER_ID", None))

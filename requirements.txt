@@ -1,5 +1,7 @@
 torch
+lightning-utilities
 filelock
-numpy < 2.0.0
+numpy
 boto3
 requests
+tifffile

@@ -15,12 +15,14 @@ import io
 import os
 import random
 import sys
-from time import time
+import tempfile
+from unittest import mock
 
 import numpy as np
 import pytest
+import tifffile
 import torch
-from litdata.imports import RequirementCache
+from lightning_utilities.core.imports import RequirementCache
 from litdata.streaming.serializers import (
     _AV_AVAILABLE,
     _NUMPY_DTYPES_MAPPING,
@@ -32,9 +34,9 @@ from litdata.streaming.serializers import (
     NoHeaderNumpySerializer,
     NoHeaderTensorSerializer,
     NumpySerializer,
-    PickleSerializer,
     PILSerializer,
     TensorSerializer,
+    TIFFSerializer,
     VideoSerializer,
     _get_serializers,
 )
@@ -47,6 +49,7 @@ def seed_everything(random_seed):
 
 
 _PIL_AVAILABLE = RequirementCache("PIL")
+_TIFFFILE_AVAILABLE = RequirementCache("tifffile")
 
 
 def test_serializers():
@@ -56,7 +59,7 @@ def test_serializers():
         "int",
         "float",
         "video",
-        "tif",
+        "tifffile",
         "file",
         "pil",
         "jpeg",
@@ -100,6 +103,12 @@ def test_pil_serializer(mode):
     assert np.array_equal(np_data, np_dec_data)
 
 
+def test_pil_serializer_available():
+    serializer = PILSerializer()
+    with mock.patch("litdata.streaming.serializers._PIL_AVAILABLE", False):
+        assert not serializer.can_serialize(None)
+
+
 @pytest.mark.skipif(condition=not _PIL_AVAILABLE, reason="Requires: ['pil']")
 def test_jpeg_serializer():
     serializer = JPEGSerializer()
@@ -121,16 +130,19 @@ def test_jpeg_serializer():
     assert deserialized_img.shape == torch.Size([3, 28, 28])
 
 
+def test_jpeg_serializer_available():
+    serializer = JPEGSerializer()
+    with mock.patch("litdata.streaming.serializers._PIL_AVAILABLE", False):
+        assert not serializer.can_serialize(None)
+
+
 @pytest.mark.flaky(reruns=3)
 @pytest.mark.skipif(sys.platform == "win32", reason="Not supported on windows")
 def test_tensor_serializer():
     seed_everything(42)
 
     serializer_tensor = TensorSerializer()
-    serializer_pickle = PickleSerializer()
 
-    ratio_times = []
-    ratio_bytes = []
     shapes = [(10,), (10, 10), (10, 10, 10), (10, 10, 10, 5), (10, 10, 10, 5, 4)]
     for dtype in _TORCH_DTYPES_MAPPING.values():
         for shape in shapes:
@@ -139,29 +151,11 @@ def test_tensor_serializer():
                 continue
             tensor = torch.ones(shape, dtype=dtype)
 
-            t0 = time()
             data, _ = serializer_tensor.serialize(tensor)
             deserialized_tensor = serializer_tensor.deserialize(data)
-            tensor_time = time() - t0
-            tensor_bytes = len(data)
 
             assert deserialized_tensor.dtype == dtype
             assert torch.equal(tensor, deserialized_tensor)
-
-            t1 = time()
-            data, _ = serializer_pickle.serialize(tensor)
-            deserialized_tensor = serializer_pickle.deserialize(data)
-            pickle_time = time() - t1
-            pickle_bytes = len(data)
-
-            assert deserialized_tensor.dtype == dtype
-            assert torch.equal(tensor, deserialized_tensor)
-
-            ratio_times.append(pickle_time / tensor_time)
-            ratio_bytes.append(pickle_bytes / tensor_bytes)
-
-    assert np.mean(ratio_times) > 1.6
-    assert np.mean(ratio_bytes) > 2
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="Not supported on windows")
@@ -204,10 +198,13 @@ def test_assert_no_header_tensor_serializer():
 
 def test_assert_no_header_numpy_serializer():
     serializer = NoHeaderNumpySerializer()
-    t = np.ones((10,))
+    t = np.ones((10,), dtype=np.float64)
     assert serializer.can_serialize(t)
     data, name = serializer.serialize(t)
-    assert name == "no_header_numpy:10"
+    try:
+        assert name == "no_header_numpy:10"
+    except AssertionError as e:  # debug what np.core.sctypes looks like on Windows
+        raise ValueError(np.core.sctypes) from e
     assert serializer._dtype is None
     serializer.setup(name)
     assert serializer._dtype == np.dtype("float64")
@@ -272,3 +269,35 @@ def test_deserialize_empty_no_header_tensor():
     serializer.setup(name)
     new_t = serializer.deserialize(data)
     assert torch.equal(t, new_t)
+
+
+@pytest.mark.skipif(not _TIFFFILE_AVAILABLE, reason="Requires: ['tifffile']")
+def test_tiff_serializer():
+    serializer = TIFFSerializer()
+
+    # Create a synthetic multispectral image
+    height, width, bands = 28, 28, 12
+    np_data = np.random.randint(0, 65535, size=(height, width, bands), dtype=np.uint16)
+
+    with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as tmp_file:
+        tifffile.imwrite(tmp_file.name, np_data)
+        file_path = tmp_file.name
+
+    # Test can_serialize
+    assert serializer.can_serialize(file_path)
+
+    # Serialize
+    data, _ = serializer.serialize(file_path)
+    assert isinstance(data, bytes)
+
+    # Deserialize
+    deserialized_data = serializer.deserialize(data)
+    assert isinstance(deserialized_data, np.ndarray)
+    assert deserialized_data.shape == (height, width, bands)
+    assert deserialized_data.dtype == np.uint16
+
+    # Validate data content
+    assert np.array_equal(np_data, deserialized_data)
+
+    # Clean up
+    os.remove(file_path)

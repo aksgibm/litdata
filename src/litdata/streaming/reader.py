@@ -19,17 +19,14 @@ from queue import Empty, Queue
 from threading import Event, Thread
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from litdata.constants import _TORCH_GREATER_EQUAL_2_1_0
 from litdata.streaming.config import ChunksConfig, Interval
-from litdata.streaming.item_loader import BaseItemLoader, PyTreeLoader
+from litdata.streaming.item_loader import BaseItemLoader, PyTreeLoader, TokensLoader
 from litdata.streaming.sampler import ChunkedIndex
 from litdata.streaming.serializers import Serializer, _get_serializers
+from litdata.utilities.encryption import Encryption
 from litdata.utilities.env import _DistributedEnv, _WorkerEnv
 
 warnings.filterwarnings("ignore", message=".*The given buffer is not writable.*")
-
-if _TORCH_GREATER_EQUAL_2_1_0:
-    pass
 
 
 logger = Logger(__name__)
@@ -83,7 +80,7 @@ class PrepareChunksThread(Thread):
         for chunk_index in chunk_indexes:
             self._to_delete_queue.put(chunk_index)
 
-    def _delete(self, chunk_index: int) -> None:
+    def _apply_delete(self, chunk_index: int) -> None:
         """Inform the item loader of the chunk to delete."""
         if self._config.can_delete(chunk_index):
             chunk_filepath, _, _ = self._config[ChunkedIndex(index=-1, chunk_index=chunk_index)]
@@ -117,7 +114,7 @@ class PrepareChunksThread(Thread):
         # Get the current cache size and decide whether we need to start cleanup. Otherwise, keep track of it
         while self._max_cache_size and self._chunks_index_to_be_deleted and self._can_delete_chunk():
             # Delete the oldest chunk
-            self._delete(self._chunks_index_to_be_deleted.pop(0))
+            self._apply_delete(self._chunks_index_to_be_deleted.pop(0))
 
         return
 
@@ -165,21 +162,27 @@ class BinaryReader:
         max_cache_size: Optional[Union[int, str]] = None,
         remote_input_dir: Optional[str] = None,
         compression: Optional[str] = None,
+        encryption: Optional[Encryption] = None,
         item_loader: Optional[BaseItemLoader] = None,
         serializers: Optional[Dict[str, Serializer]] = None,
+        storage_options: Optional[dict] = {},
+        max_pre_download: int = 2,
     ) -> None:
         """The BinaryReader enables to read chunked dataset in an efficient way.
 
-        Arguments:
+        Args:
             cache_dir: The path to cache folder.
             subsampled_files: List of subsampled chunk files loaded from `input_dir/index.json` file.
             region_of_interest: List of tuples of {start,end} of region of interest for each chunk.
             remote_input_dir: The path to a remote folder where the data are located.
                 The scheme needs to be added to the path.
             compression: The algorithm to decompress the chunks.
+            encryption: The algorithm to decrypt the chunks or samples.
             item_loader: The chunk sampler to create sub arrays from a chunk.
             max_cache_size: The maximum cache size used by the reader when fetching the chunks.
             serializers: Provide your own serializers.
+            storage_options: Additional connection options for accessing storage services.
+            max_pre_download: Maximum number of chunks that can be pre-downloaded by the reader.
 
         """
         super().__init__()
@@ -192,6 +195,7 @@ class BinaryReader:
             raise FileNotFoundError(f"The provided cache_dir `{self._cache_dir}` doesn't exist.")
 
         self._compression = compression
+        self._encryption = encryption
         self._intervals: Optional[List[str]] = None
         self.subsampled_files = subsampled_files
         self.region_of_interest = region_of_interest
@@ -203,6 +207,8 @@ class BinaryReader:
         self._item_loader = item_loader or PyTreeLoader()
         self._last_chunk_index: Optional[int] = None
         self._max_cache_size = int(os.getenv("MAX_CACHE_SIZE", max_cache_size or 0))
+        self._storage_options = storage_options
+        self._max_pre_download = max_pre_download
 
     def _get_chunk_index_from_index(self, index: int) -> Tuple[int, int]:
         # Load the config containing the index
@@ -220,6 +226,7 @@ class BinaryReader:
             self._item_loader,
             self.subsampled_files,
             self.region_of_interest,
+            self._storage_options,
         )
         return self._config
 
@@ -256,7 +263,7 @@ class BinaryReader:
             # Create and start the prepare chunks thread
             if self._prepare_thread is None and self._config:
                 self._prepare_thread = PrepareChunksThread(
-                    self._config, self._item_loader, self._distributed_env, self._max_cache_size
+                    self._config, self._item_loader, self._distributed_env, self._max_cache_size, self._max_pre_download
                 )
                 self._prepare_thread.start()
                 if index.chunk_indexes:
@@ -271,11 +278,16 @@ class BinaryReader:
                 self._last_chunk_index = index.chunk_index
 
         # Fetch the element
-        chunk_filepath, begin, chunk_bytes = self.config[index]
-        item = self._item_loader.load_item_from_chunk(
-            index.index, index.chunk_index, chunk_filepath, begin, chunk_bytes
-        )
+        chunk_filepath, begin, filesize_bytes = self.config[index]
 
+        if isinstance(self._item_loader, PyTreeLoader):
+            item = self._item_loader.load_item_from_chunk(
+                index.index, index.chunk_index, chunk_filepath, begin, filesize_bytes, self._encryption
+            )
+        else:
+            item = self._item_loader.load_item_from_chunk(
+                index.index, index.chunk_index, chunk_filepath, begin, filesize_bytes
+            )
         # We need to request deletion after the latest element has been loaded.
         # Otherwise, this could trigger segmentation fault error depending on the item loader used.
         if (
@@ -288,6 +300,11 @@ class BinaryReader:
 
             # inform the chunk has been completely consumed
             self._prepare_thread.delete([self._last_chunk_index])
+
+        if index.chunk_index != self._last_chunk_index:
+            # Close the memory-mapped file for the last chunk index
+            if isinstance(self._item_loader, TokensLoader) and self._last_chunk_index is not None:
+                self._item_loader.close(self._last_chunk_index)
 
             # track the new chunk index as the latest one
             self._last_chunk_index = index.chunk_index

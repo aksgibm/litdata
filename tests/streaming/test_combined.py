@@ -17,6 +17,9 @@ class TestCombinedStreamingDataset(CombinedStreamingDataset):
     def _check_datasets(self, datasets) -> None:
         pass
 
+    def reset_state_dict(self):
+        pass
+
 
 def test_combined_dataset_num_samples_yield():
     dataset = TestCombinedStreamingDataset(
@@ -52,7 +55,7 @@ class Range:
         self.values = list(range(start, end, step))
 
     def set_epoch(self, epoch):
-        self.values = np.random.RandomState(42 + epoch).permutation(self.values).tolist()
+        self.values = np.random.RandomState([42, epoch]).permutation(self.values).tolist()
 
     def __iter__(self):
         yield from self.values
@@ -71,8 +74,8 @@ def test_combined_dataset_iterate_over_all_4_datasets():
         data.append(list(dataset))
 
     assert len(data[0]) == 40
-    assert data[0][-3:] == [14, 13, 16]
-    assert data[1][-3:] == [14, 18, 17]
+    assert data[0][-3:] == [11, 18, 19]
+    assert data[1][-3:] == [18, 11, 12]
 
 
 def test_combined_dataset_num_samples_yield_iterate_over_all():
@@ -93,8 +96,15 @@ def test_drop_last_and_shuffle():
 
     dataset_mock_1.set_shuffle.assert_called()
     dataset_mock_2.set_shuffle.assert_called()
+
     dataset_mock_1.set_drop_last.assert_called()
     dataset_mock_2.set_drop_last.assert_called()
+
+    dataset_mock_1.set_num_workers.assert_called()
+    dataset_mock_2.set_num_workers.assert_called()
+
+    dataset_mock_1.set_batch_size.assert_called()
+    dataset_mock_2.set_batch_size.assert_called()
 
 
 class TestStatefulDataset:
@@ -225,6 +235,12 @@ class SimpleDataset(IterableDataset):
         pass
 
     def set_drop_last(self, _):
+        pass
+
+    def set_batch_size(self, _):
+        pass
+
+    def set_num_workers(self, _):
         pass
 
 
@@ -379,6 +395,7 @@ def test_combined_dataset_with_dataloader_2_epochs(tmpdir):
                     "current_epoch": 1,
                     "input_dir_path": ANY,
                     "input_dir_url": ANY,
+                    "cache_dir_path": None,
                     "item_loader": None,
                     "drop_last": False,
                     "seed": 42,
@@ -394,6 +411,7 @@ def test_combined_dataset_with_dataloader_2_epochs(tmpdir):
                     "current_epoch": 1,
                     "input_dir_path": ANY,
                     "input_dir_url": ANY,
+                    "cache_dir_path": None,
                     "item_loader": None,
                     "drop_last": False,
                     "seed": 42,
@@ -416,6 +434,7 @@ def test_combined_dataset_with_dataloader_2_epochs(tmpdir):
                     "current_epoch": 1,
                     "input_dir_path": ANY,
                     "input_dir_url": ANY,
+                    "cache_dir_path": None,
                     "item_loader": None,
                     "drop_last": False,
                     "seed": 42,
@@ -431,6 +450,7 @@ def test_combined_dataset_with_dataloader_2_epochs(tmpdir):
                     "current_epoch": 1,
                     "input_dir_path": ANY,
                     "input_dir_url": ANY,
+                    "cache_dir_path": None,
                     "item_loader": None,
                     "drop_last": False,
                     "seed": 42,
@@ -453,6 +473,7 @@ def test_combined_dataset_with_dataloader_2_epochs(tmpdir):
                     "current_epoch": 1,
                     "input_dir_path": ANY,
                     "input_dir_url": ANY,
+                    "cache_dir_path": None,
                     "item_loader": None,
                     "drop_last": False,
                     "seed": 42,
@@ -468,6 +489,7 @@ def test_combined_dataset_with_dataloader_2_epochs(tmpdir):
                     "current_epoch": 1,
                     "input_dir_path": ANY,
                     "input_dir_url": ANY,
+                    "cache_dir_path": None,
                     "item_loader": None,
                     "drop_last": False,
                     "seed": 42,
@@ -490,6 +512,7 @@ def test_combined_dataset_with_dataloader_2_epochs(tmpdir):
                     "current_epoch": 1,
                     "input_dir_path": ANY,
                     "input_dir_url": ANY,
+                    "cache_dir_path": None,
                     "item_loader": None,
                     "drop_last": False,
                     "seed": 42,
@@ -505,6 +528,7 @@ def test_combined_dataset_with_dataloader_2_epochs(tmpdir):
                     "current_epoch": 1,
                     "input_dir_path": ANY,
                     "input_dir_url": ANY,
+                    "cache_dir_path": None,
                     "item_loader": None,
                     "drop_last": False,
                     "seed": 42,
@@ -527,6 +551,7 @@ def test_combined_dataset_with_dataloader_2_epochs(tmpdir):
                     "current_epoch": 1,
                     "input_dir_path": ANY,
                     "input_dir_url": ANY,
+                    "cache_dir_path": None,
                     "item_loader": None,
                     "drop_last": False,
                     "seed": 42,
@@ -542,6 +567,7 @@ def test_combined_dataset_with_dataloader_2_epochs(tmpdir):
                     "current_epoch": 1,
                     "input_dir_path": ANY,
                     "input_dir_url": ANY,
+                    "cache_dir_path": None,
                     "item_loader": None,
                     "drop_last": False,
                     "seed": 42,
@@ -558,12 +584,13 @@ def test_combined_dataset_with_dataloader_2_epochs(tmpdir):
         {
             "dataset": {
                 "0": {
-                    "num_samples_yielded": 8,
+                    "num_samples_yielded": 9,
                     "num_workers": 3,
                     "batch_size": 2,
                     "current_epoch": 1,
                     "input_dir_path": ANY,
                     "input_dir_url": ANY,
+                    "cache_dir_path": None,
                     "item_loader": None,
                     "drop_last": False,
                     "seed": 42,
@@ -579,6 +606,7 @@ def test_combined_dataset_with_dataloader_2_epochs(tmpdir):
                     "current_epoch": 1,
                     "input_dir_path": ANY,
                     "input_dir_url": ANY,
+                    "cache_dir_path": None,
                     "item_loader": None,
                     "drop_last": False,
                     "seed": 42,
@@ -590,17 +618,18 @@ def test_combined_dataset_with_dataloader_2_epochs(tmpdir):
             },
             "current_epoch": 0,
             "latest_worker_idx": 2,
-            "num_samples_yielded": {0: [3, 1], 1: [3, 1], 2: [2, 1]},
+            "num_samples_yielded": {0: [3, 1], 1: [3, 1], 2: [3, 1]},
         },
         {
             "dataset": {
                 "0": {
-                    "num_samples_yielded": 9,
+                    "num_samples_yielded": 10,
                     "num_workers": 3,
                     "batch_size": 2,
                     "current_epoch": 1,
                     "input_dir_path": ANY,
                     "input_dir_url": ANY,
+                    "cache_dir_path": None,
                     "item_loader": None,
                     "drop_last": False,
                     "seed": 42,
@@ -616,6 +645,7 @@ def test_combined_dataset_with_dataloader_2_epochs(tmpdir):
                     "current_epoch": 1,
                     "input_dir_path": ANY,
                     "input_dir_url": ANY,
+                    "cache_dir_path": None,
                     "item_loader": None,
                     "drop_last": False,
                     "seed": 42,
@@ -627,44 +657,7 @@ def test_combined_dataset_with_dataloader_2_epochs(tmpdir):
             },
             "current_epoch": 0,
             "latest_worker_idx": 0,
-            "num_samples_yielded": {0: [4, 1], 1: [3, 1], 2: [2, 1]},
-        },
-        {
-            "dataset": {
-                "0": {
-                    "num_samples_yielded": 10,
-                    "num_workers": 3,
-                    "batch_size": 2,
-                    "current_epoch": 1,
-                    "input_dir_path": ANY,
-                    "input_dir_url": ANY,
-                    "item_loader": None,
-                    "drop_last": False,
-                    "seed": 42,
-                    "world_size": 1,
-                    "shuffle": True,
-                    "subsampled_files": ANY,
-                    "region_of_interest": ANY,
-                },
-                "1": {
-                    "num_samples_yielded": 3,
-                    "num_workers": 3,
-                    "batch_size": 2,
-                    "current_epoch": 1,
-                    "input_dir_path": ANY,
-                    "input_dir_url": ANY,
-                    "item_loader": None,
-                    "drop_last": False,
-                    "seed": 42,
-                    "world_size": 1,
-                    "shuffle": True,
-                    "subsampled_files": ANY,
-                    "region_of_interest": ANY,
-                },
-            },
-            "current_epoch": 0,
-            "latest_worker_idx": 1,
-            "num_samples_yielded": {0: [4, 1], 1: [4, 1], 2: [2, 1]},
+            "num_samples_yielded": {0: [4, 1], 1: [3, 1], 2: [3, 1]},
         },
     ]
 
@@ -678,6 +671,7 @@ def test_combined_dataset_with_dataloader_2_epochs(tmpdir):
                     "current_epoch": 2,
                     "input_dir_path": ANY,
                     "input_dir_url": ANY,
+                    "cache_dir_path": None,
                     "item_loader": None,
                     "drop_last": False,
                     "seed": 42,
@@ -693,6 +687,7 @@ def test_combined_dataset_with_dataloader_2_epochs(tmpdir):
                     "current_epoch": 2,
                     "input_dir_path": ANY,
                     "input_dir_url": ANY,
+                    "cache_dir_path": None,
                     "item_loader": None,
                     "drop_last": False,
                     "seed": 42,
@@ -715,6 +710,7 @@ def test_combined_dataset_with_dataloader_2_epochs(tmpdir):
                     "current_epoch": 2,
                     "input_dir_path": ANY,
                     "input_dir_url": ANY,
+                    "cache_dir_path": None,
                     "item_loader": None,
                     "drop_last": False,
                     "seed": 42,
@@ -730,6 +726,7 @@ def test_combined_dataset_with_dataloader_2_epochs(tmpdir):
                     "current_epoch": 2,
                     "input_dir_path": ANY,
                     "input_dir_url": ANY,
+                    "cache_dir_path": None,
                     "item_loader": None,
                     "drop_last": False,
                     "seed": 42,
@@ -752,6 +749,7 @@ def test_combined_dataset_with_dataloader_2_epochs(tmpdir):
                     "current_epoch": 2,
                     "input_dir_path": ANY,
                     "input_dir_url": ANY,
+                    "cache_dir_path": None,
                     "item_loader": None,
                     "drop_last": False,
                     "seed": 42,
@@ -767,6 +765,7 @@ def test_combined_dataset_with_dataloader_2_epochs(tmpdir):
                     "current_epoch": 2,
                     "input_dir_path": ANY,
                     "input_dir_url": ANY,
+                    "cache_dir_path": None,
                     "item_loader": None,
                     "drop_last": False,
                     "seed": 42,
@@ -789,6 +788,7 @@ def test_combined_dataset_with_dataloader_2_epochs(tmpdir):
                     "current_epoch": 2,
                     "input_dir_path": ANY,
                     "input_dir_url": ANY,
+                    "cache_dir_path": None,
                     "item_loader": None,
                     "drop_last": False,
                     "seed": 42,
@@ -804,6 +804,7 @@ def test_combined_dataset_with_dataloader_2_epochs(tmpdir):
                     "current_epoch": 2,
                     "input_dir_path": ANY,
                     "input_dir_url": ANY,
+                    "cache_dir_path": None,
                     "item_loader": None,
                     "drop_last": False,
                     "seed": 42,
@@ -826,6 +827,7 @@ def test_combined_dataset_with_dataloader_2_epochs(tmpdir):
                     "current_epoch": 2,
                     "input_dir_path": ANY,
                     "input_dir_url": ANY,
+                    "cache_dir_path": None,
                     "item_loader": None,
                     "drop_last": False,
                     "seed": 42,
@@ -841,6 +843,7 @@ def test_combined_dataset_with_dataloader_2_epochs(tmpdir):
                     "current_epoch": 2,
                     "input_dir_path": ANY,
                     "input_dir_url": ANY,
+                    "cache_dir_path": None,
                     "item_loader": None,
                     "drop_last": False,
                     "seed": 42,
@@ -857,12 +860,13 @@ def test_combined_dataset_with_dataloader_2_epochs(tmpdir):
         {
             "dataset": {
                 "0": {
-                    "num_samples_yielded": 8,
+                    "num_samples_yielded": 9,
                     "num_workers": 3,
                     "batch_size": 2,
                     "current_epoch": 2,
                     "input_dir_path": ANY,
                     "input_dir_url": ANY,
+                    "cache_dir_path": None,
                     "item_loader": None,
                     "drop_last": False,
                     "seed": 42,
@@ -878,6 +882,7 @@ def test_combined_dataset_with_dataloader_2_epochs(tmpdir):
                     "current_epoch": 2,
                     "input_dir_path": ANY,
                     "input_dir_url": ANY,
+                    "cache_dir_path": None,
                     "item_loader": None,
                     "drop_last": False,
                     "seed": 42,
@@ -889,17 +894,18 @@ def test_combined_dataset_with_dataloader_2_epochs(tmpdir):
             },
             "current_epoch": 1,
             "latest_worker_idx": 2,
-            "num_samples_yielded": {0: [3, 1], 1: [3, 1], 2: [2, 1]},
+            "num_samples_yielded": {0: [3, 1], 1: [3, 1], 2: [3, 1]},
         },
         {
             "dataset": {
                 "0": {
-                    "num_samples_yielded": 9,
+                    "num_samples_yielded": 10,
                     "num_workers": 3,
                     "batch_size": 2,
                     "current_epoch": 2,
                     "input_dir_path": ANY,
                     "input_dir_url": ANY,
+                    "cache_dir_path": None,
                     "item_loader": None,
                     "drop_last": False,
                     "seed": 42,
@@ -915,6 +921,7 @@ def test_combined_dataset_with_dataloader_2_epochs(tmpdir):
                     "current_epoch": 2,
                     "input_dir_path": ANY,
                     "input_dir_url": ANY,
+                    "cache_dir_path": None,
                     "item_loader": None,
                     "drop_last": False,
                     "seed": 42,
@@ -926,44 +933,7 @@ def test_combined_dataset_with_dataloader_2_epochs(tmpdir):
             },
             "current_epoch": 1,
             "latest_worker_idx": 0,
-            "num_samples_yielded": {0: [4, 1], 1: [3, 1], 2: [2, 1]},
-        },
-        {
-            "dataset": {
-                "0": {
-                    "num_samples_yielded": 10,
-                    "num_workers": 3,
-                    "batch_size": 2,
-                    "current_epoch": 2,
-                    "input_dir_path": ANY,
-                    "input_dir_url": ANY,
-                    "item_loader": None,
-                    "drop_last": False,
-                    "seed": 42,
-                    "world_size": 1,
-                    "shuffle": True,
-                    "subsampled_files": ANY,
-                    "region_of_interest": ANY,
-                },
-                "1": {
-                    "num_samples_yielded": 3,
-                    "num_workers": 3,
-                    "batch_size": 2,
-                    "current_epoch": 2,
-                    "input_dir_path": ANY,
-                    "input_dir_url": ANY,
-                    "item_loader": None,
-                    "drop_last": False,
-                    "seed": 42,
-                    "world_size": 1,
-                    "shuffle": True,
-                    "subsampled_files": ANY,
-                    "region_of_interest": ANY,
-                },
-            },
-            "current_epoch": 1,
-            "latest_worker_idx": 1,
-            "num_samples_yielded": {0: [4, 1], 1: [4, 1], 2: [2, 1]},
+            "num_samples_yielded": {0: [4, 1], 1: [3, 1], 2: [3, 1]},
         },
     ]
 

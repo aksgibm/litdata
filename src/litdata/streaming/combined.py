@@ -25,10 +25,10 @@ __SAMPLES_KEY__ = "__SAMPLES__"
 
 
 class CombinedStreamingDataset(IterableDataset):
-    """The `CombinedStreamingDataset` enables to stream data from multiple StreamingDataset with the sampling ratio of
+    """Enables to stream data from multiple StreamingDataset with the sampling ratio of
     your choice.
 
-    Addtionally, the `CombinedStreamingDataset` keeps track of the number of samples fetched to enable resumability
+    Additionally, the `CombinedStreamingDataset` keeps track of the number of samples fetched to enable reusability
     of the datasets.
 
     Note that due to the random sampling, the number of samples returned from the iterator is variable and a function
@@ -43,15 +43,16 @@ class CombinedStreamingDataset(IterableDataset):
         weights: Optional[Sequence[float]] = None,
         iterate_over_all: bool = True,
     ) -> None:
-        """ "
-        Arguments:
+        """Enable to stream data from multiple StreamingDataset with the sampling ratio of your choice.
+
+        Args:
             datasets: The list of the StreamingDataset to use.
             seed: The random seed to initialize the sampler
             weights: The sampling ratio for the datasets
             iterate_over_all: When iterate_over_all is True, the combined dataset iterates over all the datasets.
                 Otherwise, it stops as soon as one raises a StopIteration.
-        """
 
+        """
         self._check_datasets(datasets)
 
         self._seed = seed
@@ -118,10 +119,26 @@ class CombinedStreamingDataset(IterableDataset):
         for dataset in self._datasets:
             dataset.set_shuffle(shuffle)
 
+    def set_batch_size(self, batch_size: int) -> None:
+        """Set the current batch size to the datasets."""
+        self.batch_size = batch_size
+        for dataset in self._datasets:
+            dataset.set_batch_size(batch_size)
+
+    def set_num_workers(self, num_workers: int) -> None:
+        """Set the current number of workers to the datasets."""
+        for dataset in self._datasets:
+            dataset.set_num_workers(num_workers)
+
     def set_drop_last(self, drop_last: bool) -> None:
         """Set the current drop_last to the datasets."""
         for dataset in self._datasets:
             dataset.set_drop_last(drop_last)
+
+    def reset_state_dict(self) -> None:
+        """Reset the state of the dataset."""
+        for dataset in self._datasets:
+            dataset.reset_state_dict()
 
     def _check_datasets(self, datasets: List[StreamingDataset]) -> None:
         if any(not isinstance(d, StreamingDataset) for d in datasets):
@@ -139,7 +156,7 @@ class CombinedStreamingDataset(IterableDataset):
         num_samples_yielded = None
 
         if self._num_samples_yielded is not None and worker_env.rank in self._num_samples_yielded:
-            num_samples_yielded = self._num_samples_yielded[worker_env.rank]
+            num_samples_yielded = self._num_samples_yielded.get(worker_env.rank, 0)
 
         self._iterator = _CombinedDatasetIterator(
             self._datasets,
